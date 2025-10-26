@@ -8,6 +8,8 @@ requires-python = ">=3.12"
 dependencies = [
     "chainlit",
     "cassandra-asyncio-driver",
+    "uuid-utils",
+    "msgpack>=1.0.0",
 ]
 
 [project.urls]
@@ -28,6 +30,7 @@ dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
     "ruff>=0.8.6",
+    "cqlsh",
 ]
 
 [tool.ruff]
