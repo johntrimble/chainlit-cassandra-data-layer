@@ -1,0 +1,44 @@
+{
+  // Name for the dev container, which appears in the VS Code UI.
+  "name": "PyTorch Devcontainer",
+
+  // Points to the Docker Compose file that defines the services.
+  "dockerComposeFile": "../compose.yaml",
+
+  // The service within the Docker Compose file to use for the dev container.
+  "service": "dev",
+
+  // The folder to open in the container.
+  "workspaceFolder": "/workspace",
+
+  // Mount git config from host (cross-platform compatible)
+  "mounts": [
+    "source=${localEnv:HOME}${localEnv:USERPROFILE}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,consistency=cached",
+    // Mount SSH authentication socket for SSH agent forwarding
+    "source=${localEnv:SSH_AUTH_SOCK},target=/tmp/ssh-agent.sock,type=bind"
+  ],
+
+  // Environment variables for SSH agent forwarding
+  "remoteEnv": {
+    "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock"
+  },
+
+  // VS Code specific customizations.
+  "customizations": {
+    "vscode": {
+      // Default settings for VS Code inside the container.
+      "settings": {
+        // Sets the default Python interpreter to the one in the virtual
+        // environment.
+        "python.defaultInterpreterPath": "${containerEnv:UV_PROJECT_ENVIRONMENT}/bin/python"
+      },
+      // Extensions to install in VS Code inside the container.
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "github.copilot",
+        "anthropic.claude-code"
+      ]
+    }
+  }
+}

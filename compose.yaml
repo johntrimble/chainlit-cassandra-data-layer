@@ -1,0 +1,88 @@
+
+# Standard options we will include in our services.
+x-base-service: &base-service
+  # Include the .env file for environment variables (if it exists).
+  env_file:
+  - path: .env
+    required: false
+
+  # Make sure the container runs as the same user as the host to avoid
+  # permission issues with mounted volumes.
+  user: "${MY_UID}:${MY_GID}"
+
+  # Docker allocates 64MB of shared memory by default. This is sometimes 
+  # insufficient. Rather than mock around with settings here, we just set the
+  # IPC mode to use the host. Note that this is not recommended for production
+  # environments due to security concerns, but it is useful for development.
+  ipc: host
+
+services:
+  dev:
+    # The main development environment container.
+    # Inherits common settings from the base service anchor above.
+    <<: *base-service
+
+    build:
+      # Build context is the dev Dockerfile directory
+      context: ./services/dev/
+      additional_contexts:
+        # Allows referencing the project root in the Dockerfile
+        workspace: .
+      args:
+        # Ensure the container user matches the host user for correct file permissions.
+        # These are set in the .env file, which is initialized by script/bootstrap.
+        UID: ${MY_UID}
+        GID: ${MY_GID}
+
+    # Mount the project root and data directory into the container.
+    # This allows code and data changes on the host to be reflected in the container.
+    volumes:
+    # Mount the project root as /workspace (source code, scripts, etc)
+    - .:/workspace:cached
+    # Persist data across container restarts (models, cache, etc)
+    - ./data:/data:cached
+    # Persist claude config
+    - claude_data:/home/vscode/.claude:cached
+    # Cache
+    - cache_data:/home/vscode/.cache:cached
+    # Persist bash history
+    - commandhistory:/commandhistory:cached
+
+    # Set the working directory to where the workspace folder is mounted.
+    working_dir: /workspace
+
+    # Keep the container running (useful for VS Code dev containers, debugging, etc).
+    command: tail -f /dev/null
+
+    # Connect to the cassandra cluster
+    depends_on:
+      cassandra:
+        condition: service_healthy
+
+  # Single node Cassandra cluster
+  cassandra:
+    image: cassandra:5.0
+    environment:
+      # Configure a single-node cluster
+      - CASSANDRA_CLUSTER_NAME=PythonCassandraCluster
+      - CASSANDRA_DC=datacenter1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      # For development, we can reduce memory usage
+      - MAX_HEAP_SIZE=512M
+      - HEAP_NEWSIZE=100M
+    volumes:
+      # Persist Cassandra data
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      # Use cqlsh to check if Cassandra is ready to accept connections
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  claude_data:
+  cassandra_data:
+  cache_data:
+  commandhistory:

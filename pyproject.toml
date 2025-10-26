@@ -1,0 +1,63 @@
+[project]
+name = "chainlit-cassandra-data-layer"
+version = "0.1.0"
+description = "Chain Data Layer implementation using Cassandra"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chainlit",
+    "cassandra-asyncio-driver",
+]
+
+[project.urls]
+Repository = "https://github.com/johntrimble/chainlit-cassandra-data-layer"
+
+[build-system]
+requires = ["uv_build>=0.8.24,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[dependency-groups]
+dev = [
+    "cassandra-driver>=3.29.2",
+    "cassandra-asyncio-driver>=0.1.4",
+    "hypothesis>=6.140.3",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "ruff>=0.8.6",
+]
+
+[tool.ruff]
+lint.select = [
+  "E",  # pycodestyle
+  "F",  # Pyflakes
+  "UP", # pyupgrade
+  "B",  # flake8-bugbear
+  "I",  # isort
+]
+lint.ignore = ["E501", "B008"]
+
+[tool.ruff.format]
+# Use double quotes for strings
+quote-style = "double"
+# Indent with spaces
+indent-style = "space"
+# Respect magic trailing comma
+skip-magic-trailing-comma = false
+# Automatically detect line ending
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+publish-url = "https://test.pypi.org/legacy/"
+explicit = true
