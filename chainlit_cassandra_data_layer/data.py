@@ -342,22 +342,26 @@ class CassandraDataLayer(BaseDataLayer):
         thread_id_uuid = uuid.UUID(thread_id)
         for_id = uuid.UUID(element.for_id) if element.for_id else None
 
-        # Write to lookup table
-        lookup_query = (
-            "INSERT INTO elements (id, thread_id, for_id) VALUES (%s, %s, %s)"
+        # Generate created_at timestamp
+        created_at = datetime.now()
+
+        # Use batch to write to all tables atomically
+        from cassandra.query import BatchStatement
+
+        batch = BatchStatement()
+
+        # 1. Write to lookup table
+        batch.add(
+            "INSERT INTO elements (id, thread_id, for_id) VALUES (%s, %s, %s)",
+            (element_id, thread_id_uuid, for_id),
         )
-        await self.session.aexecute(lookup_query, (element_id, thread_id_uuid, for_id))
 
-        # Write to main elements_by_thread_id table
-        main_query = """
-            INSERT INTO elements_by_thread_id (
+        # 2. Write to elements_by_thread_id table
+        batch.add(
+            """INSERT INTO elements_by_thread_id (
                 thread_id, id, for_id, mime, name, object_key, url,
-                chainlit_key, display, size, language, page, props
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-
-        await self.session.aexecute(
-            main_query,
+                chainlit_key, display, size, language, page, props, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 thread_id_uuid,
                 element_id,
@@ -372,14 +376,26 @@ class CassandraDataLayer(BaseDataLayer):
                 element.language,
                 getattr(element, "page", None),
                 json.dumps(getattr(element, "props", {})),
+                created_at,
             ),
         )
+
+        # 3. Write to elements_by_step_id table (only if attached to a step)
+        if for_id:
+            batch.add(
+                """INSERT INTO elements_by_step_id (
+                    for_id, created_at, id, thread_id, object_key
+                ) VALUES (%s, %s, %s, %s, %s)""",
+                (for_id, created_at, element_id, thread_id_uuid, object_key),
+            )
+
+        await self.session.aexecute(batch)
 
     async def get_element(self, thread_id: str, element_id: str) -> ElementDict | None:
         """Get an element by ID and thread ID."""
         query = """
             SELECT thread_id, id, for_id, mime, name, object_key, url,
-                   chainlit_key, display, size, language, page, props
+                   chainlit_key, display, size, language, page, props, created_at
             FROM elements_by_thread_id
             WHERE thread_id = %s AND id = %s
         """
@@ -425,8 +441,8 @@ class CassandraDataLayer(BaseDataLayer):
                 return  # Element doesn't exist
             thread_id = str(lookup_row.thread_id)
 
-        # Get element details to find object_key before deleting
-        query = "SELECT object_key FROM elements_by_thread_id WHERE thread_id = %s AND id = %s"
+        # Get element details to find object_key, for_id, and created_at before deleting
+        query = "SELECT object_key, for_id, created_at FROM elements_by_thread_id WHERE thread_id = %s AND id = %s"
         rows = await self.session.aexecute(
             query, (uuid.UUID(thread_id), uuid.UUID(element_id))
         )
@@ -447,6 +463,17 @@ class CassandraDataLayer(BaseDataLayer):
         await self.session.aexecute(
             main_delete_query, (uuid.UUID(thread_id), uuid.UUID(element_id))
         )
+
+        # Delete from elements_by_step_id table (if element was attached to a step)
+        if row and row.for_id and row.created_at:
+            step_delete_query = """
+                DELETE FROM elements_by_step_id
+                WHERE for_id = %s AND created_at = %s AND id = %s
+            """
+            await self.session.aexecute(
+                step_delete_query,
+                (row.for_id, row.created_at, uuid.UUID(element_id)),
+            )
 
     # Step methods
 
@@ -577,21 +604,27 @@ class CassandraDataLayer(BaseDataLayer):
         )
         feedback_rows = await self.session.aexecute(
             feedback_select_query, (uuid.UUID(step_id),)
-        )  # Convert to UUID
+        )
         for feedback_row in feedback_rows:
             feedback_delete_query = "DELETE FROM feedbacks WHERE id = %s"
             await self.session.aexecute(feedback_delete_query, (feedback_row.id,))
 
-        # Delete elements for this step - get IDs first, then delete individually
-        elements_select_query = (
-            "SELECT id FROM elements WHERE for_id = %s ALLOW FILTERING"
-        )
-        element_rows = await self.session.aexecute(
-            elements_select_query, (uuid.UUID(step_id),)
-        )  # Convert to UUID
-        for element_row in element_rows:
-            elements_delete_query = "DELETE FROM elements WHERE id = %s"
-            await self.session.aexecute(elements_delete_query, (element_row.id,))
+        # Delete elements for this step using new elements_by_step_id table
+        # This is much faster: single partition read instead of ALLOW FILTERING
+        elements_query = """
+            SELECT id, thread_id, object_key
+            FROM elements_by_step_id
+            WHERE for_id = %s
+        """
+        element_rows = await self.session.aexecute(elements_query, (uuid.UUID(step_id),))
+
+        # Delete all elements in parallel using existing delete_element
+        # This properly cleans up storage AND deletes from all 3 tables
+        element_delete_tasks = [
+            self.delete_element(str(row.id), str(row.thread_id)) for row in element_rows
+        ]
+        if element_delete_tasks:
+            await asyncio.gather(*element_delete_tasks)
 
         # Delete from steps_by_thread_id table (need full primary key)
         step_query = """
@@ -687,7 +720,7 @@ class CassandraDataLayer(BaseDataLayer):
         # Get all elements for this thread - single partition read!
         elements_query = """
             SELECT thread_id, id, for_id, mime, name, object_key, url,
-                   chainlit_key, display, size, language, page, props
+                   chainlit_key, display, size, language, page, props, created_at
             FROM elements_by_thread_id WHERE thread_id = %s
         """
         element_rows = await self.session.aexecute(elements_query, (uuid.UUID(thread_id),))
@@ -824,20 +857,17 @@ class CassandraDataLayer(BaseDataLayer):
         thread_rows = await self.session.aexecute(thread_query, (thread_id_uuid,))
         thread_row = thread_rows[0] if thread_rows else None
 
-        # Get all elements for this thread and delete files from storage
-        elements_select_query = (
-            "SELECT id, object_key FROM elements_by_thread_id WHERE thread_id = %s"
-        )
-        element_rows = list(
-            await self.session.aexecute(elements_select_query, (thread_id_uuid,))
-        )
+        # Get all elements for this thread
+        elements_select_query = "SELECT id FROM elements_by_thread_id WHERE thread_id = %s"
+        element_rows = await self.session.aexecute(elements_select_query, (thread_id_uuid,))
 
-        if self.storage_client is not None:
-            for element_row in element_rows:
-                if element_row.object_key:
-                    await self.storage_client.delete_file(
-                        object_key=element_row.object_key
-                    )
+        # Delete all elements in parallel using delete_element
+        # This properly cleans up storage AND deletes from all 3 tables
+        element_delete_tasks = [
+            self.delete_element(str(row.id), thread_id) for row in element_rows
+        ]
+        if element_delete_tasks:
+            await asyncio.gather(*element_delete_tasks)
 
         # Get all steps for this thread to delete related feedback
         steps_query = "SELECT id FROM steps WHERE thread_id = %s ALLOW FILTERING"
@@ -852,19 +882,6 @@ class CassandraDataLayer(BaseDataLayer):
             for feedback_row in feedback_rows:
                 feedback_delete_query = "DELETE FROM feedbacks WHERE id = %s"
                 await self.session.aexecute(feedback_delete_query, (feedback_row.id,))
-
-        # Delete all elements from both tables
-        for element_row in element_rows:
-            # Delete from lookup table
-            elements_delete_query = "DELETE FROM elements WHERE id = %s"
-            await self.session.aexecute(elements_delete_query, (element_row.id,))
-
-        # Delete all elements_by_thread_id for this thread at once
-        if element_rows:
-            elements_by_thread_delete_query = (
-                "DELETE FROM elements_by_thread_id WHERE thread_id = %s"
-            )
-            await self.session.aexecute(elements_by_thread_delete_query, (thread_id_uuid,))
 
         # Delete all steps from both tables
         # For steps_by_thread_id, we can delete all steps for the thread at once

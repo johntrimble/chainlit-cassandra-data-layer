@@ -112,8 +112,21 @@ CREATE TABLE IF NOT EXISTS elements_by_thread_id (
     language TEXT,
     page INT,
     props TEXT,  -- JSON string
+    created_at TIMESTAMP,  -- Timestamp when element was created
     PRIMARY KEY (thread_id, id)
 );
+
+-- Elements by step table: optimized for delete_step() access pattern
+-- Partition key is for_id (step_id), clustering columns order elements chronologically
+-- This allows efficient retrieval and deletion of all elements attached to a step
+CREATE TABLE IF NOT EXISTS elements_by_step_id (
+    for_id UUID,              -- step_id (partition key)
+    created_at TIMESTAMP,     -- clustering column for chronological ordering
+    id UUID,                  -- element_id (clustering column for uniqueness)
+    thread_id UUID,           -- needed for delete_element()
+    object_key TEXT,          -- for visibility during cleanup
+    PRIMARY KEY (for_id, created_at, id)
+) WITH CLUSTERING ORDER BY (created_at ASC, id ASC);
 
 -- No SAI indexes needed! Single partition reads are fast.
 
