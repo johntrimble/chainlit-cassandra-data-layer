@@ -1,5 +1,6 @@
 """Integration tests for CassandraDataLayer."""
 
+import asyncio
 import uuid
 from datetime import datetime
 
@@ -231,6 +232,227 @@ class TestThreadOperations:
         for thread_id in thread_ids:
             await data_layer.delete_thread(thread_id)
 
+    async def test_list_threads_search_with_iterative_fetching(
+        self, data_layer, test_user_id
+    ):
+        """Test that list_threads with search filter correctly iterates to fill page.
+
+        Setup: 20 non-matching threads + 5 matching threads + 20 non-matching threads
+        Request: 5 threads with search filter "PROJECT"
+        Expected: Returns exactly 5 matching threads with hasNextPage=False
+
+        This verifies the iterative fetching works correctly when most results
+        are filtered out by the search term, and that hasNextPage is only true
+        when there are actually more matching results.
+        """
+        # Create user
+        user = User(identifier=test_user_id, metadata={})
+        persisted_user = await data_layer.create_user(user)
+
+        thread_ids = []
+
+        # Create 20 threads that DON'T match the search string "PROJECT"
+        # These should be skipped during iteration
+        for i in range(20):
+            thread_id = str(uuid.uuid4())
+            thread_ids.append(thread_id)
+            await data_layer.update_thread(
+                thread_id=thread_id,
+                name=f"Discussion Thread {i}",
+                user_id=persisted_user.id,
+            )
+            # Small delay to ensure ordering by activity time
+            await asyncio.sleep(0.01)
+
+        # Create 5 threads that DO match the search string "PROJECT"
+        # These are the ones we expect to get back
+        matching_thread_ids = []
+        for i in range(5):
+            thread_id = str(uuid.uuid4())
+            thread_ids.append(thread_id)
+            matching_thread_ids.append(thread_id)
+            await data_layer.update_thread(
+                thread_id=thread_id,
+                name=f"PROJECT Alpha {i}",
+                user_id=persisted_user.id,
+            )
+            await asyncio.sleep(0.01)
+
+        # Create 20 more threads that DON'T match
+        # These come after our matching threads
+        for i in range(20):
+            thread_id = str(uuid.uuid4())
+            thread_ids.append(thread_id)
+            await data_layer.update_thread(
+                thread_id=thread_id,
+                name=f"Discussion After {i}",
+                user_id=persisted_user.id,
+            )
+            await asyncio.sleep(0.01)
+
+        # Now request 5 threads with search filter "PROJECT"
+        # Should iterate through non-matching threads and return exactly 5 matching ones
+        pagination = Pagination(first=5)
+        filters = ThreadFilter(userId=persisted_user.id, search="PROJECT")
+        result = await data_layer.list_threads(pagination, filters)
+
+        # Verify we got exactly 5 results
+        assert len(result.data) == 5, f"Expected 5 results, got {len(result.data)}"
+
+        # Verify all results contain "PROJECT" in the name
+        for thread in result.data:
+            assert "PROJECT" in thread["name"], f"Thread name '{thread['name']}' should contain 'PROJECT'"
+
+        # Verify the thread IDs match our expected matching threads
+        result_ids = {thread["id"] for thread in result.data}
+        expected_ids = set(matching_thread_ids)
+        assert result_ids == expected_ids, f"Result IDs {result_ids} should match expected {expected_ids}"
+
+        # Verify hasNextPage is False since there are no more matching results
+        assert result.pageInfo.hasNextPage is False, "hasNextPage should be False when no more matching results exist"
+
+        # Clean up
+        for thread_id in thread_ids:
+            await data_layer.delete_thread(thread_id)
+
+    async def test_list_threads_search_pagination_with_cursor(
+        self, data_layer, test_user_id
+    ):
+        """Test that cursor-based pagination correctly skips non-matching threads.
+
+        Setup (oldest to newest): 1 matching + 21 non-matching + 5 matching + 20 non-matching
+        Query returns DESC order (newest first): 20 non-matching + 5 matching + 21 non-matching + 1 matching
+        Request: Page 1 with 5 threads, then Page 2 using cursor
+        Expected:
+        - Page 1: 5 matching results (PROJECT Alpha) with hasNextPage=True
+        - Page 2: 1 matching result (PROJECT Beta) with hasNextPage=False
+        - Cursor should skip the 21 non-matching threads between pages
+
+        This verifies that cursor-based pagination doesn't rescan non-matching results.
+        """
+        # Create user
+        user = User(identifier=test_user_id, metadata={})
+        persisted_user = await data_layer.create_user(user)
+
+        thread_ids = []
+        page1_thread_ids = []
+        page2_thread_ids = []
+
+        # Create threads in REVERSE order so newest (last created) appear first in results
+        # Database returns ORDER BY last_activity_at DESC (newest first)
+
+        # Create 1 thread that DOES match (page 2 results - oldest)
+        thread_id = str(uuid.uuid4())
+        thread_ids.append(thread_id)
+        page2_thread_ids.append(thread_id)
+        await data_layer.update_thread(
+            thread_id=thread_id,
+            name="PROJECT Beta",
+            user_id=persisted_user.id,
+        )
+        await asyncio.sleep(0.01)
+
+        # Create 21 threads that DON'T match (between the two pages)
+        for i in range(21):
+            thread_id = str(uuid.uuid4())
+            thread_ids.append(thread_id)
+            await data_layer.update_thread(
+                thread_id=thread_id,
+                name=f"Discussion Between {i}",
+                user_id=persisted_user.id,
+            )
+            await asyncio.sleep(0.01)
+
+        # Create 5 threads that DO match (page 1 results)
+        for i in range(5):
+            thread_id = str(uuid.uuid4())
+            thread_ids.append(thread_id)
+            page1_thread_ids.append(thread_id)
+            await data_layer.update_thread(
+                thread_id=thread_id,
+                name=f"PROJECT Alpha {i}",
+                user_id=persisted_user.id,
+            )
+            await asyncio.sleep(0.01)
+
+        # Create 20 threads that DON'T match (newest)
+        for i in range(20):
+            thread_id = str(uuid.uuid4())
+            thread_ids.append(thread_id)
+            await data_layer.update_thread(
+                thread_id=thread_id,
+                name=f"Discussion Thread {i}",
+                user_id=persisted_user.id,
+            )
+            await asyncio.sleep(0.01)
+
+        # Request page 1: 5 threads with search filter "PROJECT"
+        pagination = Pagination(first=5)
+        filters = ThreadFilter(userId=persisted_user.id, search="PROJECT")
+        page1 = await data_layer.list_threads(pagination, filters)
+
+        # Verify page 1 has exactly 5 results
+        assert len(page1.data) == 5, f"Page 1 expected 5 results, got {len(page1.data)}"
+
+        # Verify all page 1 results contain "PROJECT"
+        for thread in page1.data:
+            assert "PROJECT" in thread["name"], f"Thread name '{thread['name']}' should contain 'PROJECT'"
+
+        # Verify page 1 thread IDs match expected
+        page1_result_ids = {thread["id"] for thread in page1.data}
+        page1_expected_ids = set(page1_thread_ids)
+        assert page1_result_ids == page1_expected_ids, f"Page 1 IDs {page1_result_ids} should match {page1_expected_ids}"
+
+        # Verify hasNextPage is True
+        assert page1.pageInfo.hasNextPage is True, "Page 1 hasNextPage should be True"
+
+        # Verify we have an endCursor
+        assert page1.pageInfo.endCursor is not None, "Page 1 should have an endCursor"
+
+        # To verify we don't rescan: request page 2 WITHOUT search filter first
+        # This shows us what raw position the cursor points to in the database
+        pagination2_no_filter = Pagination(first=5, cursor=page1.pageInfo.endCursor)
+        filters_no_search = ThreadFilter(userId=persisted_user.id)
+        page2_no_filter = await data_layer.list_threads(pagination2_no_filter, filters_no_search)
+
+        # The cursor should position us close to the next matching thread
+        # If we're rescanning, we'd get many "Discussion Between" threads
+        # If cursor is efficient, we should get PROJECT Beta early in results
+        thread_names_no_filter = [t["name"] for t in page2_no_filter.data]
+
+        # Find position of PROJECT Beta in the unfiltered results
+        project_beta_position = None
+        for i, name in enumerate(thread_names_no_filter):
+            if "PROJECT Beta" in name:
+                project_beta_position = i
+                break
+
+        # PROJECT Beta should appear very early (ideally at position 0 or 1)
+        # If we were rescanning all 21 "Discussion Between" threads, it wouldn't appear in first 5
+        assert project_beta_position is not None, "PROJECT Beta should appear in first 5 results after cursor"
+        assert project_beta_position <= 1, f"PROJECT Beta at position {project_beta_position} - cursor should skip non-matches (position should be 0 or 1)"
+
+        # Now request page 2 WITH search filter
+        pagination2 = Pagination(first=5, cursor=page1.pageInfo.endCursor)
+        page2 = await data_layer.list_threads(pagination2, filters)
+
+        # Verify page 2 has exactly 1 result
+        assert len(page2.data) == 1, f"Page 2 expected 1 result, got {len(page2.data)}"
+
+        # Verify the page 2 result contains "PROJECT"
+        assert "PROJECT" in page2.data[0]["name"], f"Thread name '{page2.data[0]['name']}' should contain 'PROJECT'"
+
+        # Verify page 2 thread ID matches expected
+        page2_result_id = page2.data[0]["id"]
+        assert page2_result_id == page2_thread_ids[0], f"Page 2 ID {page2_result_id} should match {page2_thread_ids[0]}"
+
+        # Verify hasNextPage is False
+        assert page2.pageInfo.hasNextPage is False, "Page 2 hasNextPage should be False when no more matching results exist"
+
+        # Clean up
+        for thread_id in thread_ids:
+            await data_layer.delete_thread(thread_id)
+
 
 @pytest.mark.asyncio
 class TestStepOperations:
@@ -342,6 +564,13 @@ class TestStepOperations:
         thread = await data_layer.get_thread(test_thread_id)
         assert len(thread["steps"]) == 1
 
+        # Set context for delete_step (it needs context.session.thread_id)
+        from chainlit.context import context
+        from chainlit.session import BaseSession
+        if not context.session:
+            context.session = BaseSession()
+        context.session.thread_id = test_thread_id
+
         # Delete step
         await data_layer.delete_step(step_id)
 
@@ -377,6 +606,13 @@ class TestFeedbackOperations:
             "createdAt": datetime.now().isoformat() + "Z",
         }
         await data_layer.create_step(step_dict)
+
+        # Set context for feedback operations (they need context.session.thread_id)
+        from chainlit.context import context
+        from chainlit.session import BaseSession
+        if not context.session:
+            context.session = BaseSession()
+        context.session.thread_id = test_thread_id
 
         # Create feedback
         feedback = Feedback(
@@ -419,6 +655,13 @@ class TestFeedbackOperations:
             "createdAt": datetime.now().isoformat() + "Z",
         }
         await data_layer.create_step(step_dict)
+
+        # Set context for feedback operations (they need context.session.thread_id)
+        from chainlit.context import context
+        from chainlit.session import BaseSession
+        if not context.session:
+            context.session = BaseSession()
+        context.session.thread_id = test_thread_id
 
         # Create feedback
         feedback = Feedback(

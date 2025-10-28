@@ -7,7 +7,9 @@ from typing import Any
 import aiofiles
 import msgpack
 from cassandra.cluster import Session
+from cassandra.query import BatchStatement, BatchType
 from cassandra_asyncio.cluster import Cluster
+from chainlit.context import context
 from chainlit.data.base import BaseDataLayer
 from chainlit.data.storage_clients.base import BaseStorageClient
 from chainlit.data.utils import queue_until_user_message
@@ -32,6 +34,11 @@ except ImportError:
     GCSStorageClient = None  # type: ignore[assignment,misc]
 
 
+# Maximum number of threads to retrieve per page
+# This prevents excessive memory usage and ensures reasonable query performance
+MAX_THREADS_PER_PAGE = 50
+
+
 def _pack_metadata(metadata: dict[str, Any] | None) -> bytes | None:
     """Serialize metadata dict to MessagePack bytes."""
     if metadata is None or not metadata:
@@ -44,6 +51,28 @@ def _unpack_metadata(data: bytes | None) -> dict[str, Any]:
     if data is None or data == b"":
         return {}
     return msgpack.unpackb(data, raw=False)
+
+
+def _step_id_to_feedback_id(step_id: str) -> str:
+    """Convert step_id to feedback_id format: step#<uuid>.
+
+    This creates a deterministic feedback ID from the step ID, allowing us to
+    avoid storing feedback_id separately in the database while maintaining
+    distinct identifiers for feedback and steps.
+    """
+    return f"step#{step_id}"
+
+
+def _feedback_id_to_step_id(feedback_id: str) -> str:
+    """Extract step_id from feedback_id format: step#<uuid> -> <uuid>.
+
+    Reverses the _step_id_to_feedback_id conversion. If the feedback_id doesn't
+    match the expected format, it's returned as-is for backward compatibility.
+    """
+    if feedback_id.startswith("step#"):
+        return feedback_id[5:]  # Remove "step#" prefix
+    # Fallback: treat as plain step_id if format is unexpected
+    return feedback_id
 
 
 class CassandraDataLayer(BaseDataLayer):
@@ -87,6 +116,14 @@ class CassandraDataLayer(BaseDataLayer):
             return dt.replace(tzinfo=timezone.utc)
         return dt
 
+    def _parse_iso_datetime(self, iso_str: str) -> datetime:
+        """Parse ISO formatted datetime string into timezone-aware UTC datetime."""
+        normalized = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
     async def _update_thread_activity(
         self,
         thread_id: str,
@@ -120,7 +157,7 @@ class CassandraDataLayer(BaseDataLayer):
         # Fetch thread details if not provided
         if thread_name is None or thread_created_at is None:
             thread_query = """
-                SELECT name, created_at, last_activity_at
+                SELECT name, created_at, last_activity_at, deleted
                 FROM threads
                 WHERE id = %s
             """
@@ -129,6 +166,13 @@ class CassandraDataLayer(BaseDataLayer):
             if not thread_row:
                 logger.warning(
                     f"Cannot update activity for non-existent thread {thread_id}"
+                )
+                return
+
+            # Skip updates for deleted threads
+            if thread_row.deleted:
+                logger.debug(
+                    f"Skipping activity update for deleted thread {thread_id}"
                 )
                 return
 
@@ -148,8 +192,6 @@ class CassandraDataLayer(BaseDataLayer):
             )
 
         # Use batch for atomicity (delete old + insert new + update threads)
-        from cassandra.query import BatchStatement, BatchType
-
         batch = BatchStatement(batch_type=BatchType.LOGGED)
 
         # Delete old activity entry (if exists)
@@ -186,7 +228,11 @@ class CassandraDataLayer(BaseDataLayer):
 
     async def get_user(self, identifier: str) -> PersistedUser | None:
         """Get a user by identifier."""
-        query = "SELECT id, identifier, created_at, metadata FROM users WHERE identifier = %s ALLOW FILTERING"
+        query = """
+            SELECT id, identifier, created_at, metadata
+            FROM users_by_identifier
+            WHERE identifier = %s
+        """
         rows = await self.session.aexecute(query, (identifier,))
         row = rows[0] if rows else None
 
@@ -207,73 +253,119 @@ class CassandraDataLayer(BaseDataLayer):
         """Create or update a user."""
         existing_user = await self.get_user(user.identifier)
 
-        if existing_user:
-            # Update metadata - need to use INSERT to upsert in Cassandra
-            metadata_blob = _pack_metadata(user.metadata)
-            query = """
-                INSERT INTO users (id, identifier, created_at, metadata)
-                VALUES (%s, %s, %s, %s)
-            """
-            await self.session.aexecute(
-                query,
-                (
-                    uuid.UUID(existing_user.id),  # Convert string ID to UUID
-                    user.identifier,
-                    datetime.fromisoformat(existing_user.createdAt.replace("Z", "")),
-                    metadata_blob,
-                ),
-            )
-            return await self.get_user(user.identifier)
-        else:
-            # Create new user
-            user_id = uuid.uuid4()  # Generate UUID directly
-            created_at = datetime.now()
-            metadata_blob = _pack_metadata(user.metadata)
+        metadata_blob = _pack_metadata(user.metadata)
 
-            query = """
-                INSERT INTO users (id, identifier, created_at, metadata)
-                VALUES (%s, %s, %s, %s)
+        if existing_user:
+            user_id = uuid.UUID(existing_user.id)
+            created_at = self._parse_iso_datetime(existing_user.createdAt)
+        else:
+            user_id = uuid.uuid4()
+            created_at = datetime.now(timezone.utc)
+
+        batch = BatchStatement(batch_type=BatchType.LOGGED)
+        batch.add(
             """
-            await self.session.aexecute(
-                query, (user_id, user.identifier, created_at, metadata_blob)
-            )
-            return await self.get_user(user.identifier)
+            INSERT INTO users (id, identifier, created_at, metadata)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (user_id, user.identifier, created_at, metadata_blob),
+        )
+        batch.add(
+            """
+            INSERT INTO users_by_identifier (identifier, id, created_at, metadata)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (user.identifier, user_id, created_at, metadata_blob),
+        )
+
+        await self.session.aexecute(batch)
+        return await self.get_user(user.identifier)
 
     # Feedback methods
 
     async def delete_feedback(self, feedback_id: str) -> bool:
-        """Delete feedback by ID."""
-        query = "DELETE FROM feedbacks WHERE id = %s"
-        await self.session.aexecute(query, (uuid.UUID(feedback_id),))  # Convert to UUID
+        """Delete feedback by ID.
+
+        Since feedback is stored inline with steps and the feedback_id has format
+        "step#<step_uuid>", we can extract the step_id and directly locate the step.
+
+        Uses context.session.thread_id to determine which thread the step belongs to,
+        following the DynamoDB implementation pattern.
+        """
+        # Extract step_id from feedback_id format
+        step_id_str = _feedback_id_to_step_id(feedback_id)
+        step_id = uuid.UUID(step_id_str)
+
+        # Get thread_id from context (DynamoDB pattern)
+        thread_id = context.session.thread_id if context.session else None
+        if not thread_id or not isinstance(thread_id, str):
+            logger.warning(f"Cannot delete feedback {feedback_id} - thread_id not available in context")
+            return False
+
+        thread_id_uuid = uuid.UUID(thread_id)
+
+        # Clear feedback columns (no ALLOW FILTERING needed with full primary key)
+        update_query = """
+            UPDATE steps_by_thread_id
+            SET feedback_value = null, feedback_comment = null
+            WHERE thread_id = %s AND id = %s
+        """
+        await self.session.aexecute(
+            update_query,
+            (thread_id_uuid, step_id),
+        )
+
         return True
 
     async def upsert_feedback(self, feedback: Feedback) -> str:
-        """Create or update feedback."""
-        # Generate or convert feedback ID
-        if feedback.id:
-            feedback_id = uuid.UUID(feedback.id)
-        else:
-            feedback_id = uuid.uuid4()
+        """Create or update feedback for a step.
 
-        query = """
-            INSERT INTO feedbacks (id, for_id, thread_id, value, comment)
-            VALUES (%s, %s, %s, %s, %s)
+        Feedback is stored inline with the step in steps_by_thread_id table.
+        The feedback ID is derived from the step ID using the format "step#<step_uuid>".
+
+        Uses context.session.thread_id to determine which thread the step belongs to,
+        following the DynamoDB implementation pattern.
+        """
+        step_id = uuid.UUID(feedback.forId)
+
+        # Get thread_id from context (DynamoDB pattern)
+        thread_id = context.session.thread_id if context.session else None
+        if not thread_id or not isinstance(thread_id, str):
+            raise ValueError(f"Cannot upsert feedback for step {feedback.forId} - thread_id not available in context")
+
+        thread_id_uuid = uuid.UUID(thread_id)
+
+        # Update feedback columns in the step row (no ALLOW FILTERING needed with full primary key)
+        update_query = """
+            UPDATE steps_by_thread_id
+            SET feedback_value = %s, feedback_comment = %s
+            WHERE thread_id = %s AND id = %s
         """
         await self.session.aexecute(
-            query,
+            update_query,
             (
-                feedback_id,
-                uuid.UUID(feedback.forId),  # Convert to UUID
-                uuid.UUID(feedback.threadId)
-                if feedback.threadId
-                else None,  # Convert to UUID
                 feedback.value,
                 feedback.comment,
+                thread_id_uuid,
+                step_id,
             ),
         )
-        return str(feedback_id)  # Return as string for Chainlit
+
+        # Return derived feedback ID
+        return _step_id_to_feedback_id(feedback.forId)
 
     # Element methods
+
+    async def _delete_element_storage(self, object_key: str):
+        """Helper to delete element file from storage.
+
+        Args:
+            object_key: The storage key for the file to delete
+
+        This is idempotent and safe to call even if the file doesn't exist.
+        """
+        if self.storage_client is not None and object_key:
+            await self.storage_client.delete_file(object_key=object_key)
 
     @queue_until_user_message()
     async def create_element(self, element: Element):
@@ -281,21 +373,17 @@ class CassandraDataLayer(BaseDataLayer):
         if not element.for_id:
             return
 
-        # Determine thread_id - look it up from the step if not provided
+        # Determine thread_id - use element.thread_id if provided, otherwise fallback to context
         thread_id = element.thread_id
-        if not thread_id and element.for_id:
-            lookup_query = "SELECT thread_id FROM steps WHERE id = %s"
-            rows = await self.session.aexecute(lookup_query, (uuid.UUID(element.for_id),))
-            row = rows[0] if rows else None
-            if row:
-                thread_id = str(row.thread_id)
-
         if not thread_id:
-            logger.warning(
-                f"Data Layer: Cannot create element {element.id} - "
-                f"thread_id could not be determined"
-            )
-            return
+            # Fallback to context.session.thread_id (DynamoDB pattern)
+            thread_id = context.session.thread_id if context.session else None
+            if not thread_id or not isinstance(thread_id, str):
+                logger.warning(
+                    f"Data Layer: Cannot create element {element.id} - "
+                    f"thread_id not available in element or context"
+                )
+                return
 
         # Handle file uploads only if storage_client is configured
         object_key = None
@@ -345,23 +433,14 @@ class CassandraDataLayer(BaseDataLayer):
         # Generate created_at timestamp
         created_at = datetime.now()
 
-        # Use batch to write to all tables atomically
-        from cassandra.query import BatchStatement
+        # Single INSERT to elements_by_thread_id (no batch needed, no lookup table)
+        query = """INSERT INTO elements_by_thread_id (
+            thread_id, id, for_id, mime, name, object_key, url,
+            chainlit_key, display, size, language, page, props, created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
 
-        batch = BatchStatement()
-
-        # 1. Write to lookup table
-        batch.add(
-            "INSERT INTO elements (id, thread_id, for_id) VALUES (%s, %s, %s)",
-            (element_id, thread_id_uuid, for_id),
-        )
-
-        # 2. Write to elements_by_thread_id table
-        batch.add(
-            """INSERT INTO elements_by_thread_id (
-                thread_id, id, for_id, mime, name, object_key, url,
-                chainlit_key, display, size, language, page, props, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        await self.session.aexecute(
+            query,
             (
                 thread_id_uuid,
                 element_id,
@@ -380,21 +459,14 @@ class CassandraDataLayer(BaseDataLayer):
             ),
         )
 
-        # 3. Write to elements_by_step_id table (only if attached to a step)
-        if for_id:
-            batch.add(
-                """INSERT INTO elements_by_step_id (
-                    for_id, created_at, id, thread_id, object_key
-                ) VALUES (%s, %s, %s, %s, %s)""",
-                (for_id, created_at, element_id, thread_id_uuid, object_key),
-            )
-
-        await self.session.aexecute(batch)
-
     async def get_element(self, thread_id: str, element_id: str) -> ElementDict | None:
-        """Get an element by ID and thread ID."""
+        """Get an element by ID and thread ID.
+
+        Queries elements_by_thread_id directly with thread_id and id (no lookup needed).
+        """
+        # Query elements_by_thread_id with thread_id and id (no for_id needed in key)
         query = """
-            SELECT thread_id, id, for_id, mime, name, object_key, url,
+            SELECT thread_id, for_id, id, mime, name, object_key, url,
                    chainlit_key, display, size, language, page, props, created_at
             FROM elements_by_thread_id
             WHERE thread_id = %s AND id = %s
@@ -431,49 +503,37 @@ class CassandraDataLayer(BaseDataLayer):
 
     @queue_until_user_message()
     async def delete_element(self, element_id: str, thread_id: str | None = None):
-        """Delete an element by ID."""
-        # Get thread_id from lookup table if not provided
-        if not thread_id:
-            lookup_query = "SELECT thread_id FROM elements WHERE id = %s"
-            lookup_rows = await self.session.aexecute(lookup_query, (uuid.UUID(element_id),))
-            lookup_row = lookup_rows[0] if lookup_rows else None
-            if not lookup_row:
-                return  # Element doesn't exist
-            thread_id = str(lookup_row.thread_id)
+        """Delete an element by ID.
 
-        # Get element details to find object_key, for_id, and created_at before deleting
-        query = "SELECT object_key, for_id, created_at FROM elements_by_thread_id WHERE thread_id = %s AND id = %s"
-        rows = await self.session.aexecute(
-            query, (uuid.UUID(thread_id), uuid.UUID(element_id))
-        )
+        Deletion order:
+        1. Delete file from storage (idempotent)
+        2. Delete from elements_by_thread_id
+
+        Uses context.session.thread_id if thread_id not provided (DynamoDB pattern).
+        """
+        element_uuid = uuid.UUID(element_id)
+
+        # Get thread_id from parameter or context (DynamoDB pattern)
+        if not thread_id:
+            thread_id = context.session.thread_id if context.session else None
+            if not thread_id or not isinstance(thread_id, str):
+                logger.warning(f"Cannot delete element {element_id} - thread_id not available")
+                return
+
+        thread_id_uuid = uuid.UUID(thread_id)
+
+        # Get element details to find object_key before deleting
+        query = "SELECT object_key FROM elements_by_thread_id WHERE thread_id = %s AND id = %s"
+        rows = await self.session.aexecute(query, (thread_id_uuid, element_uuid))
         row = rows[0] if rows else None
 
-        # Delete file from storage if it exists
-        if self.storage_client is not None and row and row.object_key:
-            await self.storage_client.delete_file(object_key=row.object_key)
+        # Phase 1: Delete file from storage if it exists (idempotent)
+        if row and row.object_key:
+            await self._delete_element_storage(row.object_key)
 
-        # Delete from lookup table
-        lookup_delete_query = "DELETE FROM elements WHERE id = %s"
-        await self.session.aexecute(lookup_delete_query, (uuid.UUID(element_id),))
-
-        # Delete from main table
-        main_delete_query = (
-            "DELETE FROM elements_by_thread_id WHERE thread_id = %s AND id = %s"
-        )
-        await self.session.aexecute(
-            main_delete_query, (uuid.UUID(thread_id), uuid.UUID(element_id))
-        )
-
-        # Delete from elements_by_step_id table (if element was attached to a step)
-        if row and row.for_id and row.created_at:
-            step_delete_query = """
-                DELETE FROM elements_by_step_id
-                WHERE for_id = %s AND created_at = %s AND id = %s
-            """
-            await self.session.aexecute(
-                step_delete_query,
-                (row.for_id, row.created_at, uuid.UUID(element_id)),
-            )
+        # Phase 2: Delete from elements_by_thread_id (simple DELETE, no batch needed)
+        delete_query = "DELETE FROM elements_by_thread_id WHERE thread_id = %s AND id = %s"
+        await self.session.aexecute(delete_query, (thread_id_uuid, element_uuid))
 
     # Step methods
 
@@ -492,9 +552,15 @@ class CassandraDataLayer(BaseDataLayer):
         )
 
         # Update thread activity - get user_id from threads table
-        thread_query = "SELECT user_id FROM threads WHERE id = %s"
+        # Also check if thread is deleted
+        thread_query = "SELECT user_id, deleted FROM threads WHERE id = %s"
         thread_rows = await self.session.aexecute(thread_query, (uuid.UUID(thread_id),))
         thread_row = thread_rows[0] if thread_rows else None
+
+        # Reject adding steps to deleted threads
+        if thread_row and thread_row.deleted:
+            raise ValueError(f"Cannot add step to deleted thread {thread_id}")
+
         if thread_row and thread_row.user_id:
             await self._update_thread_activity(
                 thread_id=thread_id,
@@ -512,23 +578,19 @@ class CassandraDataLayer(BaseDataLayer):
             else None
         )
 
-        # Insert into lookup table
-        lookup_query = "INSERT INTO steps (id, thread_id) VALUES (%s, %s)"
-        await self.session.aexecute(
-            lookup_query,
-            (
-                uuid.UUID(step_dict["id"]),
-                uuid.UUID(step_dict["threadId"]),
-            ),
-        )
+        # Extract feedback fields if present (feedback_id is not stored, only value/comment)
+        feedback = step_dict.get("feedback")
+        feedback_value = feedback.get("value") if feedback else None
+        feedback_comment = feedback.get("comment") if feedback else None
 
         # Insert into main steps_by_thread_id table
         query = """
             INSERT INTO steps_by_thread_id (
                 id, thread_id, parent_id, name, type, streaming,
                 wait_for_answer, is_error, metadata, tags, input, output,
-                created_at, start, "end", generation, show_input, language
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                created_at, start, "end", generation, show_input, language,
+                feedback_value, feedback_comment
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         await self.session.aexecute(
@@ -556,6 +618,8 @@ class CassandraDataLayer(BaseDataLayer):
                 else None,
                 step_dict.get("showInput"),
                 step_dict.get("language"),
+                feedback_value,
+                feedback_comment,
             ),
         )
 
@@ -571,89 +635,81 @@ class CassandraDataLayer(BaseDataLayer):
 
     @queue_until_user_message()
     async def delete_step(self, step_id: str):
-        """Delete a step and related feedback/elements."""
-        # First, get the thread_id from the lookup table
-        lookup_query = "SELECT thread_id FROM steps WHERE id = %s"
-        lookup_rows = await self.session.aexecute(lookup_query, (uuid.UUID(step_id),))
-        lookup_row = lookup_rows[0] if lookup_rows else None
+        """Delete a step and related elements with retry-friendly semantics.
 
-        if not lookup_row:
-            return  # Step doesn't exist
+        Deletion order:
+        1. Delete all elements (async gather) - can retry if fails
+        2. Delete step from steps_by_thread_id
 
-        thread_id = lookup_row.thread_id
+        Note: Feedback is stored inline with the step, so it's automatically
+        deleted when the step row is deleted.
 
-        # Get the created_at timestamp from steps_by_thread_id
-        step_select_query = """
-            SELECT created_at FROM steps_by_thread_id
-            WHERE thread_id = %s AND id = %s
-            ALLOW FILTERING
+        Uses context.session.thread_id to determine which thread the step belongs to,
+        following the DynamoDB implementation pattern.
         """
-        step_rows = await self.session.aexecute(
-            step_select_query, (thread_id, uuid.UUID(step_id))
-        )
-        step_row = step_rows[0] if step_rows else None
+        step_uuid = uuid.UUID(step_id)
 
-        if not step_row:
-            return  # Step doesn't exist in main table
+        # Get thread_id from context (DynamoDB pattern)
+        thread_id = context.session.thread_id if context.session else None
+        if not thread_id or not isinstance(thread_id, str):
+            logger.warning(f"Cannot delete step {step_id} - thread_id not available in context")
+            return
 
-        created_at = step_row.created_at
+        thread_id_uuid = uuid.UUID(thread_id)
 
-        # Delete feedback for this step - get IDs first, then delete individually
-        feedback_select_query = (
-            "SELECT id FROM feedbacks WHERE for_id = %s ALLOW FILTERING"
-        )
-        feedback_rows = await self.session.aexecute(
-            feedback_select_query, (uuid.UUID(step_id),)
-        )
-        for feedback_row in feedback_rows:
-            feedback_delete_query = "DELETE FROM feedbacks WHERE id = %s"
-            await self.session.aexecute(feedback_delete_query, (feedback_row.id,))
-
-        # Delete elements for this step using new elements_by_step_id table
-        # This is much faster: single partition read instead of ALLOW FILTERING
+        # Phase 1: Delete all elements first (with error handling)
+        # Query all elements for this thread, then filter by for_id in Python
+        # (for_id is no longer a clustering column, so we can't use it in WHERE clause efficiently)
         elements_query = """
-            SELECT id, thread_id, object_key
-            FROM elements_by_step_id
-            WHERE for_id = %s
+            SELECT id, for_id
+            FROM elements_by_thread_id
+            WHERE thread_id = %s
         """
-        element_rows = await self.session.aexecute(elements_query, (uuid.UUID(step_id),))
+        all_element_rows = await self.session.aexecute(elements_query, (thread_id_uuid,))
+
+        # Filter to elements belonging to this step
+        element_rows = [row for row in all_element_rows if row.for_id == step_uuid]
 
         # Delete all elements in parallel using existing delete_element
-        # This properly cleans up storage AND deletes from all 3 tables
-        element_delete_tasks = [
-            self.delete_element(str(row.id), str(row.thread_id)) for row in element_rows
-        ]
-        if element_delete_tasks:
-            await asyncio.gather(*element_delete_tasks)
+        # This properly cleans up storage AND deletes from both tables
+        if element_rows:
+            element_delete_tasks = [
+                self.delete_element(str(row.id), thread_id) for row in element_rows
+            ]
+            try:
+                await asyncio.gather(*element_delete_tasks, return_exceptions=True)
+            except Exception as e:
+                logger.error(f"Error deleting elements for step {step_id}: {e}")
+                # Continue with step deletion even if element cleanup fails
 
-        # Delete from steps_by_thread_id table (need full primary key)
-        step_query = """
-            DELETE FROM steps_by_thread_id
-            WHERE thread_id = %s AND created_at = %s AND id = %s
-        """
-        await self.session.aexecute(step_query, (thread_id, created_at, uuid.UUID(step_id)))
-
-        # Delete from lookup table
-        lookup_delete_query = "DELETE FROM steps WHERE id = %s"
-        await self.session.aexecute(lookup_delete_query, (uuid.UUID(step_id),))
+        # Phase 2: Delete step (simple DELETE, no batch needed)
+        delete_query = "DELETE FROM steps_by_thread_id WHERE thread_id = %s AND id = %s"
+        await self.session.aexecute(delete_query, (thread_id_uuid, step_uuid))
 
     # Thread methods
 
     async def get_thread_author(self, thread_id: str) -> str:
-        """Get the author (user identifier) of a thread."""
-        query = "SELECT user_identifier FROM threads WHERE id = %s"
+        """Get the author (user identifier) of a thread.
+
+        Raises ValueError if thread doesn't exist or has been deleted.
+        """
+        query = "SELECT user_identifier, deleted FROM threads WHERE id = %s"
         rows = await self.session.aexecute(query, (uuid.UUID(thread_id),))  # Convert to UUID
         row = rows[0] if rows else None
 
-        if not row or not row.user_identifier:
+        if not row or not row.user_identifier or row.deleted:
             raise ValueError(f"Author not found for thread_id {thread_id}")
 
         return row.user_identifier
 
     async def get_thread(self, thread_id: str) -> ThreadDict | None:
-        """Get a thread with all its steps and elements."""
+        """Get a thread with all its steps and elements.
+
+        Returns None if thread doesn't exist or has been deleted.
+        If thread is marked deleted but still exists, triggers cleanup in background.
+        """
         # Get thread metadata
-        thread_query = "SELECT id, user_id, user_identifier, name, created_at, metadata, tags FROM threads WHERE id = %s"
+        thread_query = "SELECT id, user_id, user_identifier, name, created_at, metadata, tags, deleted FROM threads WHERE id = %s"
         thread_rows = await self.session.aexecute(
             thread_query, (uuid.UUID(thread_id),)
         )  # Convert to UUID
@@ -662,11 +718,19 @@ class CassandraDataLayer(BaseDataLayer):
         if not thread_row:
             return None
 
-        # Get all steps for this thread
+        # If thread is marked deleted, trigger cleanup and return None
+        if thread_row.deleted:
+            # Trigger cleanup asynchronously (don't wait for it)
+            # This handles cases where deletion failed partway through
+            asyncio.create_task(self.delete_thread(thread_id))
+            return None
+
+        # Get all steps for this thread (including feedback columns)
         steps_query = """
             SELECT id, thread_id, parent_id, name, type, streaming,
                    wait_for_answer, is_error, metadata, tags, input, output,
-                   created_at, start, "end", generation, show_input, language
+                   created_at, start, "end", generation, show_input, language,
+                   feedback_value, feedback_comment
             FROM steps_by_thread_id WHERE thread_id = %s
         """
         step_rows = await self.session.aexecute(
@@ -678,18 +742,14 @@ class CassandraDataLayer(BaseDataLayer):
         for row in step_rows:
             step_ids.append(row.id)
 
-            # Get feedback for this step
-            feedback_query = "SELECT id, value, comment FROM feedbacks WHERE for_id = %s ALLOW FILTERING"
-            feedback_rows = await self.session.aexecute(feedback_query, (row.id,))
-            feedback_row = feedback_rows[0] if feedback_rows else None
-
+            # Build feedback dict from inline columns, generating feedback_id from step_id
             feedback = None
-            if feedback_row:
+            if row.feedback_value is not None:
                 feedback = FeedbackDict(
-                    id=str(feedback_row.id),  # Convert UUID to string
+                    id=_step_id_to_feedback_id(str(row.id)),  # Generate feedback_id
                     forId=str(row.id),  # Convert UUID to string
-                    value=feedback_row.value,
-                    comment=feedback_row.comment,
+                    value=row.feedback_value,
+                    comment=row.feedback_comment,
                 )
 
             step_dict = StepDict(
@@ -716,6 +776,10 @@ class CassandraDataLayer(BaseDataLayer):
                 feedback=feedback,
             )
             steps.append(step_dict)
+
+        # Sort steps by created_at in Python (since Cassandra no longer orders by it)
+        # ISO format timestamps sort correctly as strings
+        steps.sort(key=lambda s: s.get("createdAt") or "")
 
         # Get all elements for this thread - single partition read!
         elements_query = """
@@ -776,13 +840,20 @@ class CassandraDataLayer(BaseDataLayer):
         metadata: dict | None = None,
         tags: list[str] | None = None,
     ):
-        """Create or update a thread."""
-        # Check if thread exists
-        existing_query = "SELECT created_at, metadata FROM threads WHERE id = %s"
+        """Create or update a thread.
+
+        Raises ValueError if attempting to update a deleted thread.
+        """
+        # Check if thread exists and is not deleted
+        existing_query = "SELECT created_at, metadata, deleted FROM threads WHERE id = %s"
         existing_rows = await self.session.aexecute(
             existing_query, (uuid.UUID(thread_id),)
         )  # Convert to UUID
         existing_row = existing_rows[0] if existing_rows else None
+
+        # Reject updates to deleted threads
+        if existing_row and existing_row.deleted:
+            raise ValueError(f"Cannot update deleted thread {thread_id}")
 
         created_at = existing_row.created_at if existing_row else datetime.now()
 
@@ -795,7 +866,7 @@ class CassandraDataLayer(BaseDataLayer):
         # Get user_identifier if user_id is provided
         user_identifier = None
         if user_id:
-            user_query = "SELECT identifier FROM users WHERE id = %s ALLOW FILTERING"
+            user_query = "SELECT identifier FROM users WHERE id = %s"
             user_rows = await self.session.aexecute(
                 user_query, (uuid.UUID(user_id),)
             )  # Convert to UUID
@@ -849,72 +920,87 @@ class CassandraDataLayer(BaseDataLayer):
             )
 
     async def delete_thread(self, thread_id: str):
-        """Delete a thread and all related data."""
+        """Delete a thread using efficient partition-level deletion.
+
+        Phase 1: Mark thread as deleted (soft-delete) - users immediately stop seeing it
+        Phase 2: Delete all elements (scatter-gather with storage cleanup)
+        Phase 3: Delete entire steps partition + thread rows (batch)
+
+        If thread is already deleted, continues with cleanup (handles retry on partial failures).
+        """
         thread_id_uuid = uuid.UUID(thread_id)
 
         # Get thread info for activity cleanup
-        thread_query = "SELECT user_id, last_activity_at FROM threads WHERE id = %s"
+        thread_query = "SELECT user_id, last_activity_at, deleted FROM threads WHERE id = %s"
         thread_rows = await self.session.aexecute(thread_query, (thread_id_uuid,))
         thread_row = thread_rows[0] if thread_rows else None
 
-        # Get all elements for this thread
-        elements_select_query = "SELECT id FROM elements_by_thread_id WHERE thread_id = %s"
-        element_rows = await self.session.aexecute(elements_select_query, (thread_id_uuid,))
+        if not thread_row:
+            return  # Thread doesn't exist
 
-        # Delete all elements in parallel using delete_element
-        # This properly cleans up storage AND deletes from all 3 tables
-        element_delete_tasks = [
-            self.delete_element(str(row.id), thread_id) for row in element_rows
-        ]
-        if element_delete_tasks:
-            await asyncio.gather(*element_delete_tasks)
+        # Phase 1: Mark as deleted (skip if already deleted - allow retry)
+        if not thread_row.deleted:
+            soft_delete_query = "UPDATE threads SET deleted = true WHERE id = %s"
+            await self.session.aexecute(soft_delete_query, (thread_id_uuid,))
 
-        # Get all steps for this thread to delete related feedback
-        steps_query = "SELECT id FROM steps WHERE thread_id = %s ALLOW FILTERING"
-        step_rows = list(await self.session.aexecute(steps_query, (thread_id_uuid,)))
+        # Phase 2: Delete all element storage in parallel (scatter-gather)
+        # Query all elements for this thread to get their object_keys
+        elements_query = "SELECT object_key FROM elements_by_thread_id WHERE thread_id = %s"
+        element_rows = list(await self.session.aexecute(elements_query, (thread_id_uuid,)))
 
-        for row in step_rows:
-            # Delete feedback for each step individually (get all feedback IDs first)
-            feedback_select_query = (
-                "SELECT id FROM feedbacks WHERE for_id = %s ALLOW FILTERING"
+        if element_rows:
+            # Delete all element files from storage in parallel
+            storage_delete_tasks = [
+                self._delete_element_storage(row.object_key)
+                for row in element_rows
+                if row.object_key
+            ]
+            if storage_delete_tasks:
+                try:
+                    await asyncio.gather(*storage_delete_tasks, return_exceptions=True)
+                except Exception as e:
+                    logger.error(f"Error during storage cleanup for thread {thread_id}: {e}")
+                    # Continue with thread deletion even if storage cleanup partially fails
+
+        # Phase 3: Final deletion - delete entire partitions + thread rows in batch
+        # Delete entire partitions (all steps, elements, and feedback in one operation)
+        # Plus thread metadata from both tables
+        batch = BatchStatement(batch_type=BatchType.LOGGED)
+
+        # Delete entire partition from steps_by_thread_id
+        batch.add(
+            "DELETE FROM steps_by_thread_id WHERE thread_id = %s",
+            (thread_id_uuid,)
+        )
+
+        # Delete entire partition from elements_by_thread_id
+        batch.add(
+            "DELETE FROM elements_by_thread_id WHERE thread_id = %s",
+            (thread_id_uuid,)
+        )
+
+        # Delete from threads table
+        batch.add(
+            "DELETE FROM threads WHERE id = %s",
+            (thread_id_uuid,)
+        )
+
+        # Delete from threads_by_user_activity if it exists
+        if thread_row.user_id and thread_row.last_activity_at:
+            batch.add(
+                "DELETE FROM threads_by_user_activity WHERE user_id = %s AND last_activity_at = %s AND thread_id = %s",
+                (thread_row.user_id, thread_row.last_activity_at, thread_id_uuid)
             )
-            feedback_rows = await self.session.aexecute(feedback_select_query, (row.id,))
-            for feedback_row in feedback_rows:
-                feedback_delete_query = "DELETE FROM feedbacks WHERE id = %s"
-                await self.session.aexecute(feedback_delete_query, (feedback_row.id,))
 
-        # Delete all steps from both tables
-        # For steps_by_thread_id, we can delete all steps for the thread at once
-        if step_rows:
-            steps_by_thread_delete_query = (
-                "DELETE FROM steps_by_thread_id WHERE thread_id = %s"
-            )
-            await self.session.aexecute(steps_by_thread_delete_query, (uuid.UUID(thread_id),))
-
-        # Delete from lookup table individually
-        for row in step_rows:
-            steps_delete_query = "DELETE FROM steps WHERE id = %s"
-            await self.session.aexecute(steps_delete_query, (row.id,))
-
-        # Delete from threads_by_user_activity if thread has a user
-        if thread_row and thread_row.user_id and thread_row.last_activity_at:
-            activity_delete_query = """
-                DELETE FROM threads_by_user_activity
-                WHERE user_id = %s AND last_activity_at = %s AND thread_id = %s
-            """
-            await self.session.aexecute(
-                activity_delete_query,
-                (thread_row.user_id, thread_row.last_activity_at, thread_id_uuid),
-            )
-
-        # Delete the thread itself
-        thread_delete_query = "DELETE FROM threads WHERE id = %s"
-        await self.session.aexecute(thread_delete_query, (thread_id_uuid,))
+        await self.session.aexecute(batch)
 
     async def list_threads(
         self, pagination: Pagination, filters: ThreadFilter
     ) -> PaginatedResponse[ThreadDict]:
         """List threads for a user with efficient cursor-based pagination.
+
+        Returns minimal ThreadDict objects without steps/elements (following DynamoDB approach).
+        Supports search filtering on thread names. Feedback filtering is not supported.
 
         Uses composite cursor (timestamp,thread_id) for efficient range queries
         on threads_by_user_activity clustering keys. Deduplicates and actively
@@ -925,20 +1011,64 @@ class CassandraDataLayer(BaseDataLayer):
         if not filters.userId:
             raise ValueError("userId is required")
 
+        # Log warning for unsupported feedback filter (like DynamoDB)
+        if filters.feedback is not None:
+            logger.warning(
+                "Cassandra: filters on feedback not supported. "
+                "Feedback filtering requires full thread data with steps."
+            )
+
         user_id = uuid.UUID(filters.userId)
 
-        # Parse composite cursor if provided
+        # Enforce pagination limit: clamp to MAX_THREADS_PER_PAGE
+        # If no limit provided (first=0 or None), use max
+        requested_count = pagination.first if pagination.first else MAX_THREADS_PER_PAGE
+        limit = min(requested_count, MAX_THREADS_PER_PAGE)
+
+        # Adaptive fetch size: double when search filter is active (most results will be filtered out)
+        # Clamp to MAX_THREADS_PER_PAGE to prevent excessive fetching
+        if filters.search:
+            fetch_limit = min(limit * 2, MAX_THREADS_PER_PAGE)
+        else:
+            fetch_limit = limit
+
+        # Iteratively fetch until we have enough matching results or exhaust data
+        # This handles cases where filtering removes most results
+        # To correctly determine hasNextPage, we fetch one extra batch after getting
+        # enough results to check if more matches exist
+        matching_rows = []
+        current_cursor_timestamp = None
+        current_cursor_thread_id = None
+        all_seen_threads = {}
+        all_duplicates_to_delete = []
+        reached_end = False
+        found_extra_match = False  # Tracks if we found matches beyond the requested limit
+
+        # Parse initial cursor if provided
         if pagination.cursor:
             try:
                 cursor_parts = pagination.cursor.split(",", 1)
-                cursor_timestamp = datetime.fromisoformat(cursor_parts[0])
-                # Convert to naive datetime for Cassandra comparison (Cassandra uses naive datetimes)
-                if cursor_timestamp.tzinfo is not None:
-                    cursor_timestamp = cursor_timestamp.replace(tzinfo=None)
-                cursor_thread_id = uuid.UUID(cursor_parts[1])
+                current_cursor_timestamp = datetime.fromisoformat(cursor_parts[0])
+                if current_cursor_timestamp.tzinfo is not None:
+                    current_cursor_timestamp = current_cursor_timestamp.replace(tzinfo=None)
+                current_cursor_thread_id = uuid.UUID(cursor_parts[1])
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Invalid cursor format: {pagination.cursor}, error: {e}")
+                current_cursor_timestamp = None
+                current_cursor_thread_id = None
 
-                # Efficient range query using composite clustering key
-                # (last_activity_at, thread_id) < (cursor_timestamp, cursor_thread_id)
+        # Keep fetching until we have enough results or run out of data
+        # After getting enough results, fetch one more batch to determine hasNextPage
+        while not reached_end:
+            # Stop if we have enough results AND we've checked for more matches
+            if len(matching_rows) >= limit and found_extra_match:
+                break
+            # Also stop if we already have more than limit (found extra matches)
+            if len(matching_rows) > limit:
+                found_extra_match = True
+                break
+            # Build query based on whether we have a cursor
+            if current_cursor_timestamp and current_cursor_thread_id:
                 query = """
                     SELECT thread_id, thread_name, thread_created_at, last_activity_at
                     FROM threads_by_user_activity
@@ -948,54 +1078,85 @@ class CassandraDataLayer(BaseDataLayer):
                 """
                 rows = await self.session.aexecute(
                     query,
-                    (user_id, cursor_timestamp, cursor_thread_id, pagination.first + 5),
+                    (user_id, current_cursor_timestamp, current_cursor_thread_id, fetch_limit + 3),
                 )
-            except (ValueError, IndexError) as e:
-                logger.warning(
-                    f"Invalid cursor format: {pagination.cursor}, error: {e}"
-                )
-                # Fall back to first page if cursor is invalid
-                pagination.cursor = None
-
-        if not pagination.cursor:
-            # First page - no cursor
-            query = """
-                SELECT thread_id, thread_name, thread_created_at, last_activity_at
-                FROM threads_by_user_activity
-                WHERE user_id = %s
-                LIMIT %s
-            """
-            rows = await self.session.aexecute(query, (user_id, pagination.first + 5))
-
-        # Deduplicate and identify old duplicates to clean up
-        seen_threads = {}
-        duplicates_to_delete = []
-
-        for row in rows:
-            thread_id_str = str(row.thread_id)
-
-            if thread_id_str not in seen_threads:
-                # First occurrence - keep it
-                seen_threads[thread_id_str] = row
             else:
-                # Duplicate found!
-                existing = seen_threads[thread_id_str]
+                query = """
+                    SELECT thread_id, thread_name, thread_created_at, last_activity_at
+                    FROM threads_by_user_activity
+                    WHERE user_id = %s
+                    LIMIT %s
+                """
+                rows = await self.session.aexecute(query, (user_id, fetch_limit + 3))
 
-                if row.last_activity_at > existing.last_activity_at:
-                    # This row is newer - keep it, mark old one for deletion
-                    duplicates_to_delete.append(existing)
-                    seen_threads[thread_id_str] = row
-                else:
-                    # Existing row is newer - mark this one for deletion
-                    duplicates_to_delete.append(row)
+            # If we got no rows, we've reached the end
+            if not rows:
+                reached_end = True
+                break
 
-        # Clean up old duplicates in background (don't block pagination)
-        if duplicates_to_delete:
+            # Deduplicate within this batch
+            seen_threads = {}
+            duplicates_to_delete = []
+
+            for row in rows:
+                thread_id_str = str(row.thread_id)
+
+                # Check against all previously seen threads across all fetches
+                if thread_id_str not in all_seen_threads:
+                    if thread_id_str not in seen_threads:
+                        seen_threads[thread_id_str] = row
+                        all_seen_threads[thread_id_str] = row
+                    else:
+                        existing = seen_threads[thread_id_str]
+                        if row.last_activity_at > existing.last_activity_at:
+                            duplicates_to_delete.append(existing)
+                            seen_threads[thread_id_str] = row
+                            all_seen_threads[thread_id_str] = row
+                        else:
+                            duplicates_to_delete.append(row)
+
+            all_duplicates_to_delete.extend(duplicates_to_delete)
+
+            # Get unique rows from this batch
+            unique_rows = list(seen_threads.values())
+
+            # Apply search filter if provided
+            if filters.search:
+                search_lower = filters.search.lower()
+                batch_matching = [
+                    row for row in unique_rows
+                    if search_lower in (row.thread_name or "").lower()
+                ]
+            else:
+                batch_matching = unique_rows
+
+            # Add to our accumulated results
+            matching_rows.extend(batch_matching)
+
+            # If we now have more than limit matches, we know there's a next page
+            if len(matching_rows) > limit:
+                found_extra_match = True
+
+            # Update cursor to last row for next iteration
+            if unique_rows:
+                last_row = unique_rows[-1]
+                current_cursor_timestamp = last_row.last_activity_at
+                current_cursor_thread_id = last_row.thread_id
+
+            # If we got fewer rows than requested, we've reached the end
+            if len(rows) < fetch_limit:
+                reached_end = True
+                # Mark that we've checked for extra matches (even if we didn't find any)
+                if len(matching_rows) >= limit:
+                    found_extra_match = True
+
+        # Clean up all duplicates found across all fetches in background
+        if all_duplicates_to_delete:
             logger.info(
-                f"Cleaning up {len(duplicates_to_delete)} duplicate entries "
+                f"Cleaning up {len(all_duplicates_to_delete)} duplicate entries "
                 f"for user {filters.userId}"
             )
-            for dup in duplicates_to_delete:
+            for dup in all_duplicates_to_delete:
                 try:
                     delete_query = """
                         DELETE FROM threads_by_user_activity
@@ -1009,33 +1170,59 @@ class CassandraDataLayer(BaseDataLayer):
                         f"Failed to delete duplicate entry for thread {dup.thread_id}: {e}"
                     )
 
-        # Get unique rows (already in correct order from Cassandra)
-        unique_rows = list(seen_threads.values())
+        # Take only the requested limit number after filtering
+        paginated_rows = matching_rows[:limit]
 
-        # Take only requested number
-        paginated_rows = unique_rows[: pagination.first]
-
-        # Fetch full thread data for paginated results (in parallel with true async)
-        thread_tasks = [self.get_thread(str(row.thread_id)) for row in paginated_rows]
-        thread_results = await asyncio.gather(*thread_tasks)
-        threads = [t for t in thread_results if t is not None]
+        # Build minimal ThreadDict objects directly from query results
+        # Following DynamoDB approach: return only metadata without steps/elements
+        threads = []
+        for row in paginated_rows:
+            thread_dict = ThreadDict(
+                id=str(row.thread_id),
+                createdAt=self._to_utc_datetime(row.thread_created_at).isoformat(),
+                name=row.thread_name,
+                userId=str(user_id),  # Available from query context (partition key)
+                steps=[],  # Empty array - UI will call get_thread when needed
+                elements=[],  # Empty array
+                # Optional fields omitted: userIdentifier, metadata, tags
+            )
+            threads.append(thread_dict)
 
         # Build composite cursor for last row: "timestamp,thread_id"
         end_cursor = None
         start_cursor = None
         if paginated_rows:
-            last_row = paginated_rows[-1]
-            end_cursor = (
-                f"{self._to_utc_datetime(last_row.last_activity_at).isoformat()},{last_row.thread_id}"
-            )
+            # For start cursor, use the first row we're returning
             first_row = paginated_rows[0]
             start_cursor = (
                 f"{self._to_utc_datetime(first_row.last_activity_at).isoformat()},{first_row.thread_id}"
             )
 
+            # For end cursor, we want to position right before the first match on the next page
+            # This ensures the next page doesn't rescan rows we've already processed
+            if len(matching_rows) > limit:
+                # There is a next page - use the first match of next page
+                next_page_first_match = matching_rows[limit]  # The first match for next page
+
+                # Add 1ms to its timestamp to position cursor right before it
+                # Query uses (last_activity_at, thread_id) < (cursor) in DESC order
+                # So cursor with timestamp + 1ms will position us right before this match
+                from datetime import timedelta
+                cursor_timestamp = next_page_first_match.last_activity_at + timedelta(milliseconds=1)
+                end_cursor = (
+                    f"{self._to_utc_datetime(cursor_timestamp).isoformat()},{next_page_first_match.thread_id}"
+                )
+            else:
+                # No next page - use the last row we're returning
+                last_row = paginated_rows[-1]
+                end_cursor = (
+                    f"{self._to_utc_datetime(last_row.last_activity_at).isoformat()},{last_row.thread_id}"
+                )
+
         # Determine if there are more pages
-        # We fetched pagination.first + 5, so if we have more than pagination.first unique results, there are more pages
-        has_next_page = len(unique_rows) > pagination.first
+        # hasNextPage is true only if we found more matching results than requested
+        # This is determined by finding matches beyond the limit during our fetch loop
+        has_next_page = len(matching_rows) > limit
 
         return PaginatedResponse(
             pageInfo=PageInfo(
