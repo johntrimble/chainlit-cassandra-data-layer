@@ -7,7 +7,7 @@ from typing import Any
 import aiofiles
 import msgpack
 from cassandra import ConsistencyLevel
-from cassandra.cluster import Session, EXEC_PROFILE_DEFAULT
+from cassandra.cluster import Session, EXEC_PROFILE_DEFAULT, PreparedStatement
 from cassandra.query import BatchStatement, BatchType
 from chainlit.context import context
 from chainlit.data.base import BaseDataLayer
@@ -127,6 +127,7 @@ class CassandraDataLayer(BaseDataLayer):
         self._table_steps_by_thread = self._qualified_table("steps_by_thread_id")
         self._table_elements_by_thread = self._qualified_table("elements_by_thread_id")
         self.storage_client = storage_client
+        self._prepared_statements: dict[str, PreparedStatement] = {}
 
     def setup(self, replication_factor: int = 3) -> None:
         mm = MigrationManager(self.session, self.keyspace, replication_factor=replication_factor)
@@ -135,6 +136,31 @@ class CassandraDataLayer(BaseDataLayer):
     def _qualified_table(self, table: str) -> str:
         """Return the fully qualified table name for the configured keyspace."""
         return f"{self.keyspace}.{table}"
+
+    def _get_prepared_statement(self, query: str) -> PreparedStatement:
+        """Return a prepared statement for the given query, preparing it lazily."""
+        statement = self._prepared_statements.get(query)
+        if statement is None:
+            prepared_query = query.replace("%s", "?")
+            statement = self.session.prepare(prepared_query)
+            if self.default_consistency_level is not None:
+                statement.consistency_level = self.default_consistency_level
+            self._prepared_statements[query] = statement
+        return statement
+
+    async def _aexecute_prepared(
+        self, query: str, parameters: tuple[Any, ...] = ()
+    ):
+        """Execute a prepared statement asynchronously with the provided parameters."""
+        statement = self._get_prepared_statement(query)
+        return await self.session.aexecute(statement, parameters)
+
+    def _batch_add_prepared(
+        self, batch: BatchStatement, query: str, parameters: tuple[Any, ...]
+    ) -> None:
+        """Add a prepared statement with parameters to a batch."""
+        statement = self._get_prepared_statement(query)
+        batch.add(statement, parameters)
 
     def _get_current_timestamp(self) -> str:
         """Get current timestamp in ISO format (UTC)."""
@@ -195,7 +221,7 @@ class CassandraDataLayer(BaseDataLayer):
                 FROM {self._table_threads}
                 WHERE id = %s
             """
-            thread_rows = await self.session.aexecute(thread_query, (thread_id_uuid,))
+            thread_rows = await self._aexecute_prepared(thread_query, (thread_id_uuid,))
             thread_row = thread_rows[0] if thread_rows else None
             if not thread_row:
                 logger.warning(
@@ -220,7 +246,7 @@ class CassandraDataLayer(BaseDataLayer):
             old_activity_query = (
                 f"SELECT last_activity_at FROM {self._table_threads} WHERE id = %s"
             )
-            old_activity_rows = await self.session.aexecute(
+            old_activity_rows = await self._aexecute_prepared(
                 old_activity_query, (thread_id_uuid,)
             )
             old_activity_row = old_activity_rows[0] if old_activity_rows else None
@@ -233,14 +259,16 @@ class CassandraDataLayer(BaseDataLayer):
 
         # Delete old activity entry (if exists)
         if old_activity_at:
-            batch.add(
+            self._batch_add_prepared(
+                batch,
                 f"""DELETE FROM {self._table_threads_by_user_activity}
                    WHERE user_id = %s AND last_activity_at = %s AND thread_id = %s""",
                 (user_id_uuid, old_activity_at, thread_id_uuid),
             )
 
         # Insert new activity entry
-        batch.add(
+        self._batch_add_prepared(
+            batch,
             f"""INSERT INTO {self._table_threads_by_user_activity}
                (user_id, last_activity_at, thread_id, thread_name, thread_created_at)
                VALUES (%s, %s, %s, %s, %s)""",
@@ -254,7 +282,8 @@ class CassandraDataLayer(BaseDataLayer):
         )
 
         # Update threads table with new last_activity_at
-        batch.add(
+        self._batch_add_prepared(
+            batch,
             f"UPDATE {self._table_threads} SET last_activity_at = %s WHERE id = %s",
             (activity_timestamp, thread_id_uuid),
         )
@@ -270,7 +299,7 @@ class CassandraDataLayer(BaseDataLayer):
             FROM {self._table_users_by_identifier}
             WHERE identifier = %s
         """
-        rows = await self.session.aexecute(query, (identifier,))
+        rows = await self._aexecute_prepared(query, (identifier,))
         row = rows[0] if rows else None
 
         if not row:
@@ -300,14 +329,16 @@ class CassandraDataLayer(BaseDataLayer):
             created_at = datetime.now(timezone.utc)
 
         batch = BatchStatement(batch_type=BatchType.LOGGED)
-        batch.add(
+        self._batch_add_prepared(
+            batch,
             f"""
             INSERT INTO {self._table_users} (id, identifier, created_at, metadata)
             VALUES (%s, %s, %s, %s)
             """,
             (user_id, user.identifier, created_at, metadata_blob),
         )
-        batch.add(
+        self._batch_add_prepared(
+            batch,
             f"""
             INSERT INTO {self._table_users_by_identifier} (identifier, id, created_at, metadata)
             VALUES (%s, %s, %s, %s)
@@ -347,7 +378,7 @@ class CassandraDataLayer(BaseDataLayer):
             SET feedback_value = null, feedback_comment = null
             WHERE thread_id = %s AND id = %s
         """
-        await self.session.aexecute(
+        await self._aexecute_prepared(
             update_query,
             (thread_id_uuid, step_id),
         )
@@ -378,7 +409,7 @@ class CassandraDataLayer(BaseDataLayer):
             SET feedback_value = %s, feedback_comment = %s
             WHERE thread_id = %s AND id = %s
         """
-        await self.session.aexecute(
+        await self._aexecute_prepared(
             update_query,
             (
                 feedback.value,
@@ -476,7 +507,7 @@ class CassandraDataLayer(BaseDataLayer):
             chainlit_key, display, size, language, page, props, created_at
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
 
-        await self.session.aexecute(
+        await self._aexecute_prepared(
             query,
             (
                 thread_id_uuid,
@@ -508,7 +539,7 @@ class CassandraDataLayer(BaseDataLayer):
             FROM {self._table_elements_by_thread}
             WHERE thread_id = %s AND id = %s
         """
-        rows = await self.session.aexecute(
+        rows = await self._aexecute_prepared(
             query, (uuid.UUID(thread_id), uuid.UUID(element_id))
         )
         row = rows[0] if rows else None
@@ -563,7 +594,7 @@ class CassandraDataLayer(BaseDataLayer):
         query = (
             f"SELECT object_key FROM {self._table_elements_by_thread} WHERE thread_id = %s AND id = %s"
         )
-        rows = await self.session.aexecute(query, (thread_id_uuid, element_uuid))
+        rows = await self._aexecute_prepared(query, (thread_id_uuid, element_uuid))
         row = rows[0] if rows else None
 
         # Phase 1: Delete file from storage if it exists (idempotent)
@@ -574,7 +605,7 @@ class CassandraDataLayer(BaseDataLayer):
         delete_query = (
             f"DELETE FROM {self._table_elements_by_thread} WHERE thread_id = %s AND id = %s"
         )
-        await self.session.aexecute(delete_query, (thread_id_uuid, element_uuid))
+        await self._aexecute_prepared(delete_query, (thread_id_uuid, element_uuid))
 
     # Step methods
 
@@ -597,7 +628,7 @@ class CassandraDataLayer(BaseDataLayer):
         thread_query = (
             f"SELECT user_id, deleted FROM {self._table_threads} WHERE id = %s"
         )
-        thread_rows = await self.session.aexecute(thread_query, (uuid.UUID(thread_id),))
+        thread_rows = await self._aexecute_prepared(thread_query, (uuid.UUID(thread_id),))
         thread_row = thread_rows[0] if thread_rows else None
 
         # Reject adding steps to deleted threads
@@ -629,7 +660,7 @@ class CassandraDataLayer(BaseDataLayer):
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
-        await self.session.aexecute(
+        await self._aexecute_prepared(
             query,
             (
                 uuid.UUID(step_dict["id"]),  # Convert to UUID
@@ -694,7 +725,7 @@ class CassandraDataLayer(BaseDataLayer):
             FROM {self._table_elements_by_thread}
             WHERE thread_id = %s
         """
-        all_element_rows = await self.session.aexecute(elements_query, (thread_id_uuid,))
+        all_element_rows = await self._aexecute_prepared(elements_query, (thread_id_uuid,))
 
         # Filter to elements belonging to this step
         element_rows = [row for row in all_element_rows if row.for_id == step_uuid]
@@ -715,7 +746,7 @@ class CassandraDataLayer(BaseDataLayer):
         delete_query = (
             f"DELETE FROM {self._table_steps_by_thread} WHERE thread_id = %s AND id = %s"
         )
-        await self.session.aexecute(delete_query, (thread_id_uuid, step_uuid))
+        await self._aexecute_prepared(delete_query, (thread_id_uuid, step_uuid))
 
     # Thread methods
 
@@ -727,7 +758,7 @@ class CassandraDataLayer(BaseDataLayer):
         query = (
             f"SELECT user_identifier, deleted FROM {self._table_threads} WHERE id = %s"
         )
-        rows = await self.session.aexecute(query, (uuid.UUID(thread_id),))  # Convert to UUID
+        rows = await self._aexecute_prepared(query, (uuid.UUID(thread_id),))  # Convert to UUID
         row = rows[0] if rows else None
 
         if not row or not row.user_identifier or row.deleted:
@@ -745,7 +776,7 @@ class CassandraDataLayer(BaseDataLayer):
         thread_query = (
             f"SELECT id, user_id, user_identifier, name, created_at, metadata, tags, deleted FROM {self._table_threads} WHERE id = %s"
         )
-        thread_rows = await self.session.aexecute(
+        thread_rows = await self._aexecute_prepared(
             thread_query, (uuid.UUID(thread_id),)
         )  # Convert to UUID
         thread_row = thread_rows[0] if thread_rows else None
@@ -768,7 +799,7 @@ class CassandraDataLayer(BaseDataLayer):
                    feedback_value, feedback_comment
             FROM {self._table_steps_by_thread} WHERE thread_id = %s
         """
-        step_rows = await self.session.aexecute(
+        step_rows = await self._aexecute_prepared(
             steps_query, (uuid.UUID(thread_id),)
         )  # Convert to UUID
 
@@ -822,7 +853,7 @@ class CassandraDataLayer(BaseDataLayer):
                    chainlit_key, display, size, language, page, props, created_at
             FROM {self._table_elements_by_thread} WHERE thread_id = %s
         """
-        element_rows = await self.session.aexecute(elements_query, (uuid.UUID(thread_id),))
+        element_rows = await self._aexecute_prepared(elements_query, (uuid.UUID(thread_id),))
 
         elements = []
         for row in element_rows:
@@ -883,7 +914,7 @@ class CassandraDataLayer(BaseDataLayer):
         existing_query = (
             f"SELECT created_at, metadata, deleted FROM {self._table_threads} WHERE id = %s"
         )
-        existing_rows = await self.session.aexecute(
+        existing_rows = await self._aexecute_prepared(
             existing_query, (uuid.UUID(thread_id),)
         )  # Convert to UUID
         existing_row = existing_rows[0] if existing_rows else None
@@ -906,7 +937,7 @@ class CassandraDataLayer(BaseDataLayer):
             user_query = (
                 f"SELECT identifier FROM {self._table_users} WHERE id = %s"
             )
-            user_rows = await self.session.aexecute(
+            user_rows = await self._aexecute_prepared(
                 user_query, (uuid.UUID(user_id),)
             )  # Convert to UUID
             user_row = user_rows[0] if user_rows else None
@@ -929,7 +960,7 @@ class CassandraDataLayer(BaseDataLayer):
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
 
-        await self.session.aexecute(
+        await self._aexecute_prepared(
             query,
             (
                 uuid.UUID(thread_id),  # Convert to UUID
@@ -973,7 +1004,7 @@ class CassandraDataLayer(BaseDataLayer):
         thread_query = (
             f"SELECT user_id, last_activity_at, deleted FROM {self._table_threads} WHERE id = %s"
         )
-        thread_rows = await self.session.aexecute(thread_query, (thread_id_uuid,))
+        thread_rows = await self._aexecute_prepared(thread_query, (thread_id_uuid,))
         thread_row = thread_rows[0] if thread_rows else None
 
         if not thread_row:
@@ -984,14 +1015,14 @@ class CassandraDataLayer(BaseDataLayer):
             soft_delete_query = (
                 f"UPDATE {self._table_threads} SET deleted = true WHERE id = %s"
             )
-            await self.session.aexecute(soft_delete_query, (thread_id_uuid,))
+            await self._aexecute_prepared(soft_delete_query, (thread_id_uuid,))
 
         # Phase 2: Delete all element storage in parallel (scatter-gather)
         # Query all elements for this thread to get their object_keys
         elements_query = (
             f"SELECT object_key FROM {self._table_elements_by_thread} WHERE thread_id = %s"
         )
-        element_rows = list(await self.session.aexecute(elements_query, (thread_id_uuid,)))
+        element_rows = list(await self._aexecute_prepared(elements_query, (thread_id_uuid,)))
 
         if element_rows:
             # Delete all element files from storage in parallel
@@ -1013,28 +1044,32 @@ class CassandraDataLayer(BaseDataLayer):
         batch = BatchStatement(batch_type=BatchType.LOGGED)
 
         # Delete entire partition from steps_by_thread_id
-        batch.add(
+        self._batch_add_prepared(
+            batch,
             f"DELETE FROM {self._table_steps_by_thread} WHERE thread_id = %s",
-            (thread_id_uuid,)
+            (thread_id_uuid,),
         )
 
         # Delete entire partition from elements_by_thread_id
-        batch.add(
+        self._batch_add_prepared(
+            batch,
             f"DELETE FROM {self._table_elements_by_thread} WHERE thread_id = %s",
-            (thread_id_uuid,)
+            (thread_id_uuid,),
         )
 
         # Delete from threads table
-        batch.add(
+        self._batch_add_prepared(
+            batch,
             f"DELETE FROM {self._table_threads} WHERE id = %s",
-            (thread_id_uuid,)
+            (thread_id_uuid,),
         )
 
         # Delete from threads_by_user_activity if it exists
         if thread_row.user_id and thread_row.last_activity_at:
-            batch.add(
+            self._batch_add_prepared(
+                batch,
                 f"DELETE FROM {self._table_threads_by_user_activity} WHERE user_id = %s AND last_activity_at = %s AND thread_id = %s",
-                (thread_row.user_id, thread_row.last_activity_at, thread_id_uuid)
+                (thread_row.user_id, thread_row.last_activity_at, thread_id_uuid),
             )
 
         await self.session.aexecute(batch)
@@ -1121,7 +1156,7 @@ class CassandraDataLayer(BaseDataLayer):
                     AND (last_activity_at, thread_id) < (%s, %s)
                     LIMIT %s
                 """
-                rows = await self.session.aexecute(
+                rows = await self._aexecute_prepared(
                     query,
                     (user_id, current_cursor_timestamp, current_cursor_thread_id, fetch_limit + 3),
                 )
@@ -1132,7 +1167,7 @@ class CassandraDataLayer(BaseDataLayer):
                     WHERE user_id = %s
                     LIMIT %s
                 """
-                rows = await self.session.aexecute(query, (user_id, fetch_limit + 3))
+                rows = await self._aexecute_prepared(query, (user_id, fetch_limit + 3))
 
             # If we got no rows, we've reached the end
             if not rows:
@@ -1207,7 +1242,7 @@ class CassandraDataLayer(BaseDataLayer):
                         DELETE FROM {self._table_threads_by_user_activity}
                         WHERE user_id = %s AND last_activity_at = %s AND thread_id = %s
                     """
-                    await self.session.aexecute(
+                    await self._aexecute_prepared(
                         delete_query, (user_id, dup.last_activity_at, dup.thread_id)
                     )
                 except Exception as e:
