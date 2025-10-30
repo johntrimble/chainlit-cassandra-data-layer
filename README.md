@@ -48,6 +48,11 @@ Run `chainlit run app.py` once your Cassandra node is reachable (set `CASSANDRA_
 - Pagination is cursor-based but still issues extra fetches to deduplicate outdated activity entries.
 
 
+## Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for information on setting up a development environment, running tests, and contributing.
+
+
 ## License
 
 MIT
