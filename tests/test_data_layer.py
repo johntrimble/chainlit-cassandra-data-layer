@@ -5,18 +5,38 @@ import uuid
 from datetime import datetime
 
 import pytest
+from cassandra_asyncio.cluster import Cluster
 from chainlit.types import Feedback, PageInfo, Pagination, ThreadFilter
 from chainlit.user import User
 
 from chainlit_cassandra_data_layer.data import CassandraDataLayer
 
+TEST_KEYSPACE = "chainlit_test"
+
 
 @pytest.fixture
-def data_layer():
+def cassandra_session():
+    """Provide a Cassandra session for tests."""
+    cluster = Cluster(contact_points=["cassandra"])
+    session = cluster.connect()
+    try:
+        yield session
+    finally:
+        session.shutdown()
+        cluster.shutdown()
+
+
+@pytest.fixture
+def data_layer(cassandra_session):
     """Create a CassandraDataLayer instance for testing."""
-    layer = CassandraDataLayer(contact_points=["cassandra"], keyspace="chainlit")
-    yield layer
-    layer.cluster.shutdown()
+    cassandra_session.execute(f"DROP KEYSPACE IF EXISTS {TEST_KEYSPACE}")
+    data_layer = CassandraDataLayer(session=cassandra_session, keyspace=TEST_KEYSPACE)
+    data_layer.setup(replication_factor=1)
+    try:
+        yield data_layer
+    finally:
+        if not getattr(cassandra_session, "is_shutdown", False):
+            cassandra_session.execute(f"DROP KEYSPACE IF EXISTS {TEST_KEYSPACE}")
 
 
 @pytest.fixture
@@ -535,6 +555,69 @@ class TestStepOperations:
         assert (
             thread["steps"][0]["createdAt"][:23] == created_at[:23]
         )  # Compare up to milliseconds
+
+        # Clean up
+        await data_layer.delete_thread(test_thread_id)
+
+    async def test_update_step_preserves_feedback(
+        self, data_layer, test_user_id, test_thread_id
+    ):
+        """Updating a step should not clear existing feedback."""
+        # Create user and thread
+        user = User(identifier=test_user_id, metadata={})
+        persisted_user = await data_layer.create_user(user)
+        await data_layer.update_thread(
+            thread_id=test_thread_id, name="Test Thread", user_id=persisted_user.id
+        )
+
+        # Create step
+        step_id = str(uuid.uuid4())
+        created_at = datetime.now().isoformat() + "Z"
+        step_dict = {
+            "id": step_id,
+            "threadId": test_thread_id,
+            "name": "Original Step",
+            "type": "assistant_message",
+            "output": "Original output",
+            "createdAt": created_at,
+        }
+        await data_layer.create_step(step_dict)
+
+        # Attach feedback using dedicated API (requires thread context)
+        from chainlit.context import context
+        from chainlit.session import BaseSession
+
+        if not context.session:
+            context.session = BaseSession()
+        context.session.thread_id = test_thread_id
+
+        feedback = Feedback(
+            forId=step_id,
+            threadId=test_thread_id,
+            value=1,
+            comment="Great response!",
+        )
+        await data_layer.upsert_feedback(feedback)
+
+        # Update step without providing feedback field
+        updated_step_dict = {
+            "id": step_id,
+            "threadId": test_thread_id,
+            "name": "Updated Step",
+            "type": "assistant_message",
+            "output": "Updated output",
+            "createdAt": created_at,
+        }
+        await data_layer.update_step(updated_step_dict)
+
+        # Verify feedback is preserved
+        thread = await data_layer.get_thread(test_thread_id)
+        assert thread is not None
+        assert len(thread["steps"]) == 1
+        step = thread["steps"][0]
+        assert step["feedback"] is not None, "Feedback should persist after update_step"
+        assert step["feedback"]["value"] == 1
+        assert step["feedback"]["comment"] == "Great response!"
 
         # Clean up
         await data_layer.delete_thread(test_thread_id)

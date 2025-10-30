@@ -1,0 +1,93 @@
+[[migration]]
+version = 1
+name = "initial_schema"
+description = "Create initial initial_schema"
+statements = [
+  """
+  CREATE KEYSPACE IF NOT EXISTS ${keyspace}
+  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': ${replication_factor}};
+  """,
+  """
+  CREATE TABLE IF NOT EXISTS ${keyspace}.users (
+    id UUID PRIMARY KEY,
+    identifier TEXT,
+    created_at TIMESTAMP,
+    metadata BLOB
+  );
+  """,
+  """
+  CREATE TABLE IF NOT EXISTS ${keyspace}.users_by_identifier (
+    identifier TEXT PRIMARY KEY,
+    id UUID,
+    created_at TIMESTAMP,
+    metadata BLOB
+  );
+  """,
+  """
+  CREATE TABLE IF NOT EXISTS ${keyspace}.threads (
+    id UUID PRIMARY KEY,
+    user_id UUID,
+    user_identifier TEXT,
+    name TEXT,
+    created_at TIMESTAMP,
+    last_activity_at TIMESTAMP,
+    metadata BLOB,
+    tags LIST<TEXT>,
+    deleted BOOLEAN
+  );
+  """,
+  """
+  CREATE TABLE IF NOT EXISTS ${keyspace}.threads_by_user_activity (
+    user_id UUID,
+    last_activity_at TIMESTAMP,
+    thread_id UUID,
+    thread_name TEXT,
+    thread_created_at TIMESTAMP,
+    PRIMARY KEY (user_id, last_activity_at, thread_id)
+  ) WITH CLUSTERING ORDER BY (last_activity_at DESC, thread_id ASC);
+  """,
+  """
+  CREATE TABLE IF NOT EXISTS ${keyspace}.steps_by_thread_id (
+    thread_id UUID,
+    id UUID,
+    parent_id UUID,
+    name TEXT,
+    type TEXT,
+    streaming BOOLEAN,
+    wait_for_answer BOOLEAN,
+    is_error BOOLEAN,
+    metadata BLOB,
+    tags LIST<TEXT>,
+    input TEXT,
+    output TEXT,
+    created_at TIMESTAMP,
+    start TIMESTAMP,
+    end TIMESTAMP,
+    generation BLOB,
+    show_input TEXT,
+    language TEXT,
+    feedback_value INT,
+    feedback_comment TEXT,
+    PRIMARY KEY (thread_id, id)
+  );
+  """,
+  """
+  CREATE TABLE IF NOT EXISTS ${keyspace}.elements_by_thread_id (
+    thread_id UUID,
+    id UUID,
+    for_id UUID,
+    mime TEXT,
+    name TEXT,
+    object_key TEXT,
+    url TEXT,
+    chainlit_key TEXT,
+    display TEXT,
+    size BIGINT,
+    language TEXT,
+    page INT,
+    props TEXT,
+    created_at TIMESTAMP,
+    PRIMARY KEY (thread_id, id)
+  );
+  """
+]
