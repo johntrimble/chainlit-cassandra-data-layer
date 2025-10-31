@@ -912,7 +912,9 @@ class CassandraDataLayer(BaseDataLayer):
         """
         # Check if thread exists and is not deleted
         existing_query = (
-            f"SELECT created_at, metadata, deleted FROM {self._table_threads} WHERE id = %s"
+            f"""SELECT created_at, last_activity_at, metadata, deleted,
+                        user_id, user_identifier, name, tags
+                 FROM {self._table_threads} WHERE id = %s"""
         )
         existing_rows = await self._aexecute_prepared(
             existing_query, (uuid.UUID(thread_id),)
@@ -923,13 +925,26 @@ class CassandraDataLayer(BaseDataLayer):
         if existing_row and existing_row.deleted:
             raise ValueError(f"Cannot update deleted thread {thread_id}")
 
-        created_at = existing_row.created_at if existing_row else datetime.now()
+        now_utc = datetime.now(timezone.utc)
+        existing_created_at = (
+            self._to_utc_datetime(existing_row.created_at)
+            if existing_row and existing_row.created_at
+            else None
+        )
+        created_at = existing_created_at if existing_created_at else now_utc
 
         # Merge metadata if updating
-        if metadata is not None and existing_row and existing_row.metadata:
-            base_metadata = _unpack_metadata(existing_row.metadata)
+        base_metadata = (
+            _unpack_metadata(existing_row.metadata)
+            if existing_row and existing_row.metadata
+            else None
+        )
+        if metadata is not None:
+            base_dict = base_metadata or {}
             incoming = {k: v for k, v in metadata.items() if v is not None}
-            metadata = {**base_metadata, **incoming}
+            metadata = {**base_dict, **incoming}
+        else:
+            metadata = base_metadata
 
         # Get user_identifier if user_id is provided
         user_identifier = None
@@ -943,15 +958,22 @@ class CassandraDataLayer(BaseDataLayer):
             user_row = user_rows[0] if user_rows else None
             if user_row:
                 user_identifier = user_row.identifier
+        elif existing_row:
+            user_identifier = existing_row.user_identifier
 
         # Determine final values
-        final_user_id = (
-            uuid.UUID(user_id)
-            if user_id
-            else (existing_row and getattr(existing_row, "user_id", None))
+        if user_id:
+            final_user_id = uuid.UUID(user_id)
+        elif existing_row and existing_row.user_id:
+            final_user_id = existing_row.user_id
+        else:
+            final_user_id = None
+
+        final_name = name if name is not None else (
+            existing_row.name if existing_row else None
         )
-        final_name = (
-            name if name else (existing_row and getattr(existing_row, "name", None))
+        final_tags = tags if tags is not None else (
+            list(existing_row.tags) if existing_row and existing_row.tags else None
         )
 
         # Build the INSERT statement
@@ -970,23 +992,27 @@ class CassandraDataLayer(BaseDataLayer):
                 else (existing_row and getattr(existing_row, "user_identifier", None)),
                 final_name,
                 created_at,
-                _pack_metadata(metadata)
-                if metadata
-                else (existing_row.metadata if existing_row else None),
-                tags
-                if tags
-                else (existing_row and getattr(existing_row, "tags", None)),
+                _pack_metadata(metadata) if metadata else None,
+                final_tags,
             ),
         )
 
         # Update activity tracking if thread has a user
         if final_user_id:
+            existing_last_activity = (
+                self._to_utc_datetime(existing_row.last_activity_at)
+                if existing_row and existing_row.last_activity_at
+                else None
+            )
+            activity_timestamp = existing_last_activity or created_at
+            thread_created_at = created_at if not existing_created_at else existing_created_at
+
             await self._update_thread_activity(
                 thread_id=thread_id,
                 user_id=str(final_user_id),
-                activity_timestamp=created_at,
+                activity_timestamp=activity_timestamp,
                 thread_name=final_name,
-                thread_created_at=created_at,
+                thread_created_at=thread_created_at,
             )
 
     async def delete_thread(self, thread_id: str):

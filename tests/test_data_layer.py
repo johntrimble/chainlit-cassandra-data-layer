@@ -216,6 +216,33 @@ class TestThreadOperations:
         for thread_id in thread_ids:
             await data_layer.delete_thread(thread_id)
 
+    async def test_update_thread_preserves_existing_fields(
+        self, data_layer, test_user_id, test_thread_id
+    ):
+        """Ensure update_thread does not overwrite name/user/tags when omitted."""
+        user = User(identifier=test_user_id, metadata={})
+        persisted_user = await data_layer.create_user(user)
+
+        await data_layer.update_thread(
+            thread_id=test_thread_id,
+            name="Original Thread",
+            user_id=persisted_user.id,
+            tags=["initial"],
+        )
+
+        # Update metadata without restating user/name/tags
+        await data_layer.update_thread(
+            thread_id=test_thread_id,
+            metadata={"status": "active"},
+        )
+
+        thread = await data_layer.get_thread(test_thread_id)
+        assert thread is not None
+        assert thread["name"] == "Original Thread"
+        assert thread["userId"] == persisted_user.id
+        assert thread["tags"] == ["initial"]
+        assert thread["metadata"]["status"] == "active"
+
     async def test_list_threads_pagination(self, data_layer, test_user_id):
         """Test thread pagination."""
         # Create user
@@ -508,6 +535,7 @@ class TestStepOperations:
         assert thread["steps"][0]["id"] == step_id
         assert thread["steps"][0]["name"] == "Test Step"
         assert thread["steps"][0]["output"] == "Hello, world!"
+        assert thread["userId"] == persisted_user.id
 
         # Clean up
         await data_layer.delete_thread(test_thread_id)
