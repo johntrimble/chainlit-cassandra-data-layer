@@ -19,18 +19,31 @@ from chainlit.user import User
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason="Cassandra update_thread ignores metadata name override when empty string",
-)
 async def test_update_thread_metadata_name_parity(data_layer, sqlite_data_layer):
     """Regression reproduction: metadata update should not desynchronise thread name."""
+    # In SQLAlchemyDataLayer, updating the name in the metadata also updates
+    # the thread name.
     await _run_equivalence_sequence(
         operation_sequence=[{"type": "update_thread", "metadata": {"name": ""}}],
         data_layer=data_layer,
         sqlite_data_layer=sqlite_data_layer,
     )
 
+@pytest.mark.asyncio
+async def test_update_thread_metadata_no_name_parity(data_layer, sqlite_data_layer):
+    """Regression reproduction: metadata update without name should not desynchronise thread name."""
+    # In SQLAlchemyDataLayer, if the name is specified without specifying the
+    # metadata, it leaves the metadata unchanged but does change the name. If
+    # neither is specified, it does not change the thread name or metadata.
+    await _run_equivalence_sequence(
+        operation_sequence=[
+            {"type": "update_thread", "metadata": {"name": ""}},
+            {"type": "update_thread", "name": "a"},
+            {"type": "update_thread"},
+        ],
+        data_layer=data_layer,
+        sqlite_data_layer=sqlite_data_layer,
+    )
 
 @pytest.fixture
 def sqlite_data_layer(tmp_path):
@@ -305,15 +318,6 @@ async def _assert_equivalent_states(
     assert left == right, f"Thread mismatch:\nCassandra={left}\nSQLAlchemy={right}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Cassandra update_thread ignores metadata name override when empty string",
-)
-@settings(
-    max_examples=10,
-    deadline=None,
-    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
-)
 @given(operation_sequence=operation_sequences())
 def test_cassandra_and_sqlalchemy_equivalence(
     operation_sequence, data_layer, sqlite_data_layer

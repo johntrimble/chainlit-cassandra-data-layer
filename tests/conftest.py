@@ -4,12 +4,34 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
+from hypothesis import HealthCheck, settings
 from cassandra_asyncio.cluster import Cluster
 from chainlit.context import ChainlitContext, context_var
 
 from chainlit_cassandra_data_layer.data import CassandraDataLayer
 
 TEST_KEYSPACE = "chainlit_test"
+
+
+settings.register_profile(
+    "default",
+    settings(
+        max_examples=50,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    ),
+)
+
+settings.register_profile(
+    "heavy",
+    settings(
+        max_examples=1_000,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    ),
+)
+
+settings.load_profile("default")
 
 
 @pytest.fixture(autouse=True)

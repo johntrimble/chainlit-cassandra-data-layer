@@ -934,17 +934,18 @@ class CassandraDataLayer(BaseDataLayer):
         created_at = existing_created_at if existing_created_at else now_utc
 
         # Merge metadata if updating
-        base_metadata = (
+        existing_metadata = (
             _unpack_metadata(existing_row.metadata)
             if existing_row and existing_row.metadata
             else None
         )
-        if metadata is not None:
-            base_dict = base_metadata or {}
+        metadata_provided = metadata is not None
+        if metadata_provided:
+            base_dict = existing_metadata.copy() if existing_metadata else {}
             incoming = {k: v for k, v in metadata.items() if v is not None}
-            metadata = {**base_dict, **incoming}
+            metadata_dict = {**base_dict, **incoming}
         else:
-            metadata = base_metadata
+            metadata_dict = existing_metadata
 
         # Get user_identifier if user_id is provided
         user_identifier = None
@@ -969,9 +970,17 @@ class CassandraDataLayer(BaseDataLayer):
         else:
             final_user_id = None
 
-        final_name = name if name is not None else (
-            existing_row.name if existing_row else None
-        )
+        if name is not None:
+            final_name = name
+        elif metadata_provided and metadata_dict is not None and "name" in metadata_dict:
+            final_name = metadata_dict["name"]
+        elif existing_row:
+            final_name = existing_row.name
+        else:
+            final_name = None
+
+        if final_name is not None and not isinstance(final_name, str):
+            final_name = str(final_name)
         final_tags = tags if tags is not None else (
             list(existing_row.tags) if existing_row and existing_row.tags else None
         )
@@ -992,7 +1001,7 @@ class CassandraDataLayer(BaseDataLayer):
                 else (existing_row and getattr(existing_row, "user_identifier", None)),
                 final_name,
                 created_at,
-                _pack_metadata(metadata) if metadata else None,
+                _pack_metadata(metadata_dict) if metadata_dict else None,
                 final_tags,
             ),
         )
