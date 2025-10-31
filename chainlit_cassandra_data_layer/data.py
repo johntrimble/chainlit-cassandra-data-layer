@@ -2,7 +2,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import aiofiles
 import msgpack
@@ -45,14 +45,16 @@ def _pack_metadata(metadata: dict[str, Any] | None) -> bytes | None:
     """Serialize metadata dict to MessagePack bytes."""
     if metadata is None or not metadata:
         return None
-    return msgpack.packb(metadata, use_bin_type=True)
+    packed = msgpack.packb(metadata, use_bin_type=True)
+    return cast(bytes, packed)
 
 
 def _unpack_metadata(data: bytes | None) -> dict[str, Any]:
     """Deserialize MessagePack bytes to metadata dict."""
     if data is None or data == b"":
         return {}
-    return msgpack.unpackb(data, raw=False)
+    unpacked = msgpack.unpackb(data, raw=False)
+    return cast(dict[str, Any], unpacked)
 
 
 def _step_id_to_feedback_id(step_id: str) -> str:
@@ -442,16 +444,19 @@ class CassandraDataLayer(BaseDataLayer):
             return
 
         # Determine thread_id - use element.thread_id if provided, otherwise fallback to context
-        thread_id = element.thread_id
+        thread_id: str | None = element.thread_id
         if not thread_id:
             # Fallback to context.session.thread_id (DynamoDB pattern)
-            thread_id = context.session.thread_id if context.session else None
-            if not thread_id or not isinstance(thread_id, str):
+            context_thread_id = context.session.thread_id if context.session else None
+            if not context_thread_id or not isinstance(context_thread_id, str):
                 logger.warning(
                     f"Data Layer: Cannot create element {element.id} - "
                     f"thread_id not available in element or context"
                 )
                 return
+            thread_id = context_thread_id
+
+        assert isinstance(thread_id, str)
 
         # Handle file uploads only if storage_client is configured
         object_key = None
@@ -617,10 +622,11 @@ class CassandraDataLayer(BaseDataLayer):
         # Update thread timestamp
         await self.update_thread(thread_id)
 
+        created_at_raw = step_dict.get("createdAt")
         created_at = (
-            datetime.fromisoformat(step_dict["createdAt"].replace("Z", ""))
-            if step_dict.get("createdAt")
-            else datetime.now()
+            self._parse_iso_datetime(created_at_raw)
+            if isinstance(created_at_raw, str) and created_at_raw
+            else datetime.now(timezone.utc)
         )
 
         # Update thread activity - get user_id from threads table
@@ -641,14 +647,16 @@ class CassandraDataLayer(BaseDataLayer):
                 user_id=str(thread_row.user_id),
                 activity_timestamp=created_at,
             )
+        start_raw = step_dict.get("start")
         start_time = (
-            datetime.fromisoformat(step_dict["start"].replace("Z", ""))
-            if step_dict.get("start")
+            self._parse_iso_datetime(start_raw)
+            if isinstance(start_raw, str) and start_raw
             else None
         )
+        end_raw = step_dict.get("end")
         end_time = (
-            datetime.fromisoformat(step_dict["end"].replace("Z", ""))
-            if step_dict.get("end")
+            self._parse_iso_datetime(end_raw)
+            if isinstance(end_raw, str) and end_raw
             else None
         )
 
@@ -764,7 +772,7 @@ class CassandraDataLayer(BaseDataLayer):
         if not row or not row.user_identifier or row.deleted:
             raise ValueError(f"Author not found for thread_id {thread_id}")
 
-        return row.user_identifier
+        return cast(str, row.user_identifier)
 
     async def get_thread(self, thread_id: str) -> ThreadDict | None:
         """Get a thread with all its steps and elements.
@@ -880,20 +888,25 @@ class CassandraDataLayer(BaseDataLayer):
             )
             elements.append(element_dict)
 
+        created_at_value = (
+            self._to_utc_datetime(thread_row.created_at).isoformat()
+            if thread_row.created_at
+            else self._get_current_timestamp()
+        )
+        metadata_value = (
+            _unpack_metadata(thread_row.metadata) if thread_row.metadata else None
+        )
+
         return ThreadDict(
             id=str(thread_row.id),  # Convert UUID to string
-            createdAt=self._to_utc_datetime(thread_row.created_at).isoformat()
-            if thread_row.created_at
-            else None,
+            createdAt=created_at_value,
             name=thread_row.name,
             userId=str(thread_row.user_id)
             if thread_row.user_id
             else None,  # Convert UUID to string
             userIdentifier=thread_row.user_identifier,
             tags=thread_row.tags,
-            metadata=_unpack_metadata(thread_row.metadata)
-            if thread_row.metadata
-            else None,
+            metadata=metadata_value,
             steps=steps,
             elements=elements,
         )
@@ -903,7 +916,7 @@ class CassandraDataLayer(BaseDataLayer):
         thread_id: str,
         name: str | None = None,
         user_id: str | None = None,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
         tags: list[str] | None = None,
     ):
         """Create or update a thread.
@@ -934,18 +947,21 @@ class CassandraDataLayer(BaseDataLayer):
         created_at = existing_created_at if existing_created_at else now_utc
 
         # Merge metadata if updating
-        existing_metadata = (
+        existing_metadata: dict[str, Any] | None = (
             _unpack_metadata(existing_row.metadata)
             if existing_row and existing_row.metadata
             else None
         )
         metadata_provided = metadata is not None
-        if metadata_provided:
-            base_dict = existing_metadata.copy() if existing_metadata else {}
+        metadata_dict: dict[str, Any] | None
+        if metadata is not None:
+            base_dict = existing_metadata.copy() if existing_metadata is not None else {}
             incoming = {k: v for k, v in metadata.items() if v is not None}
             metadata_dict = {**base_dict, **incoming}
         else:
-            metadata_dict = existing_metadata
+            metadata_dict = (
+                existing_metadata.copy() if existing_metadata is not None else None
+            )
 
         # Get user_identifier if user_id is provided
         user_identifier = None
@@ -1151,11 +1167,11 @@ class CassandraDataLayer(BaseDataLayer):
         # This handles cases where filtering removes most results
         # To correctly determine hasNextPage, we fetch one extra batch after getting
         # enough results to check if more matches exist
-        matching_rows = []
-        current_cursor_timestamp = None
-        current_cursor_thread_id = None
-        all_seen_threads = {}
-        all_duplicates_to_delete = []
+        matching_rows: list[Any] = []
+        current_cursor_timestamp: datetime | None = None
+        current_cursor_thread_id: uuid.UUID | None = None
+        all_seen_threads: dict[str, Any] = {}
+        all_duplicates_to_delete: list[Any] = []
         reached_end = False
         found_extra_match = False  # Tracks if we found matches beyond the requested limit
 
@@ -1290,16 +1306,19 @@ class CassandraDataLayer(BaseDataLayer):
 
         # Build minimal ThreadDict objects directly from query results
         # Following DynamoDB approach: return only metadata without steps/elements
-        threads = []
+        threads: list[ThreadDict] = []
         for row in paginated_rows:
             thread_dict = ThreadDict(
                 id=str(row.thread_id),
                 createdAt=self._to_utc_datetime(row.thread_created_at).isoformat(),
                 name=row.thread_name,
                 userId=str(user_id),  # Available from query context (partition key)
+                userIdentifier=None,
+                tags=None,
+                metadata=None,
                 steps=[],  # Empty array - UI will call get_thread when needed
                 elements=[],  # Empty array
-                # Optional fields omitted: userIdentifier, metadata, tags
+                # Optional fields default to None when not available from index query
             )
             threads.append(thread_dict)
 

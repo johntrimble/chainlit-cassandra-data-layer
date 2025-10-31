@@ -105,21 +105,27 @@ Edit code in `chainlit_cassandra_data_layer/` or add tests in `tests/`.
 pytest
 ```
 
-### 4. Format Code
+### 4. Run Type Checker
+
+```bash
+uv run mypy
+```
+
+### 5. Format Code
 
 ```bash
 ruff check --fix
 ruff format
 ```
 
-### 5. Commit Changes
+### 6. Commit Changes
 
 ```bash
 git add .
 git commit -m "Description of changes"
 ```
 
-### 6. Push and Create PR
+### 7. Push and Create PR
 
 ```bash
 git push origin feature/your-feature-name
