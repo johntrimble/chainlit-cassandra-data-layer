@@ -45,7 +45,6 @@ Run `chainlit run app.py` once your Cassandra node is reachable (set `CASSANDRA_
 
 - `list_threads()` requires `filters.userId` and can’t currently filter by feedback.
 - Search only inspects `thread_name` and performs a case-insensitive substring match; the scan runs over the user’s entire partition, so expect higher latency with many threads.
-- Pagination is cursor-based but still issues extra fetches to deduplicate outdated activity entries.
 
 
 ## Development
