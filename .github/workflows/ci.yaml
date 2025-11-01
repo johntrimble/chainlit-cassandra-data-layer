@@ -6,11 +6,16 @@ on:
   pull_request:
     branches: [ main, master ]
 
+env:
+  BAKE_LOAD: "true"
+  BAKE_CACHE_TO: ""
+
 jobs:
   build-image:
     runs-on: ubuntu-latest
     env:
       BAKE_CACHE_TO: dev.cache-to=type=gha,mode=max,scope=ci
+      BAKE_LOAD: "false"
 
     steps:
     - &checkout_step
@@ -32,7 +37,7 @@ jobs:
         source: "."
         files: "compose.yaml"
         push: false
-        load: true
+        load: ${{ env.BAKE_LOAD == 'true' }}
         set: ${{ format('dev.cache-from=type=gha,scope=ci{0}', env.BAKE_CACHE_TO != '' && format('\n{0}', env.BAKE_CACHE_TO) || '') }}
 
   lint:
