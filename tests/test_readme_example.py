@@ -26,7 +26,9 @@ def test_readme_usage_example(tmp_path):
     app_file = app_dir / "app.py"
     app_file.write_text(usage_code + "\n", encoding="utf-8")
 
-    package_src = Path(__file__).resolve().parent.parent / "chainlit_cassandra_data_layer"
+    package_src = (
+        Path(__file__).resolve().parent.parent / "chainlit_cassandra_data_layer"
+    )
     package_dst = site_packages / "chainlit_cassandra_data_layer"
     shutil.copytree(package_src, package_dst)
 

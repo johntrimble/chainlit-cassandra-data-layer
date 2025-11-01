@@ -4,9 +4,9 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
-from hypothesis import HealthCheck, settings
 from cassandra_asyncio.cluster import Cluster
 from chainlit.context import ChainlitContext, context_var
+from hypothesis import HealthCheck, settings
 
 from chainlit_cassandra_data_layer.data import CassandraDataLayer
 
@@ -18,7 +18,10 @@ settings.register_profile(
     settings(
         max_examples=50,
         deadline=None,
-        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+        suppress_health_check=[
+            HealthCheck.too_slow,
+            HealthCheck.function_scoped_fixture,
+        ],
     ),
 )
 
@@ -27,7 +30,10 @@ settings.register_profile(
     settings(
         max_examples=1_000,
         deadline=None,
-        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+        suppress_health_check=[
+            HealthCheck.too_slow,
+            HealthCheck.function_scoped_fixture,
+        ],
     ),
 )
 
