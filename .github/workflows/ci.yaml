@@ -6,27 +6,25 @@ on:
   pull_request:
     branches: [ main, master ]
 
-env:
-  COMPOSE_PROJECT_NAME: ci
-
 jobs:
   build-image:
     runs-on: ubuntu-latest
 
-    outputs:
-      image-artifact: dev-image
-
     steps:
-    - uses: actions/checkout@v4
+    - &checkout_step
+      uses: actions/checkout@v4
 
-    - name: Set up Docker Buildx
+    - &setup_buildx_step
+      name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Bootstrap
+    - &bootstrap_step
+      name: Bootstrap
       run: |
         ./script/bootstrap
 
-    - name: Build Docker Images
+    - &bake_step
+      name: Build Docker Images
       uses: docker/bake-action@v6
       with:
         source: "."
@@ -37,40 +35,18 @@ jobs:
           dev.cache-from=type=gha,scope=ci
           dev.cache-to=type=gha,mode=max,scope=ci
 
-    - name: Export dev image
-      run: |
-        docker image save "$(docker compose config --images | grep -m 1 dev)" --output dev-image.tar
-
-    - name: Upload dev image artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: dev-image
-        path: dev-image.tar
-        retention-days: 1
-
   lint:
     runs-on: ubuntu-latest
     needs: build-image
 
     steps:
-    - uses: actions/checkout@v4
+    - *checkout_step
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+    - *setup_buildx_step
 
-    - name: Bootstrap
-      run: |
-        ./script/bootstrap
+    - *bootstrap_step
 
-    - name: Download dev image
-      uses: actions/download-artifact@v4
-      with:
-        name: ${{ needs.build-image.outputs.image-artifact }}
-        path: .
-
-    - name: Load dev image
-      run: |
-        docker load --input dev-image/dev-image.tar
+    - *bake_step
 
     - name: Check formatting with ruff
       run: |
@@ -90,24 +66,13 @@ jobs:
     needs: build-image
 
     steps:
-    - uses: actions/checkout@v4
+    - *checkout_step
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+    - *setup_buildx_step
 
-    - name: Bootstrap
-      run: |
-        ./script/bootstrap
+    - *bootstrap_step
 
-    - name: Download dev image
-      uses: actions/download-artifact@v4
-      with:
-        name: ${{ needs.build-image.outputs.image-artifact }}
-        path: .
-
-    - name: Load dev image
-      run: |
-        docker load --input dev-image/dev-image.tar
+    - *bake_step
 
     - name: Run tests in dev container
       run: |
@@ -128,24 +93,13 @@ jobs:
     needs: build-image
 
     steps:
-    - uses: actions/checkout@v4
+    - *checkout_step
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+    - *setup_buildx_step
 
-    - name: Bootstrap
-      run: |
-        ./script/bootstrap
+    - *bootstrap_step
 
-    - name: Download dev image
-      uses: actions/download-artifact@v4
-      with:
-        name: ${{ needs.build-image.outputs.image-artifact }}
-        path: .
-
-    - name: Load dev image
-      run: |
-        docker load --input dev-image/dev-image.tar
+    - *bake_step
 
     - name: Run tests in dev container
       run: |
