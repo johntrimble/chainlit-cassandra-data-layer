@@ -40,22 +40,19 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -eux
-        CACHE_FROM_ARG="--set ${BAKE_CACHE_FROM}"
-        CACHE_TO_ARG=""
-        OUTPUT_ARG=""
+        ARGS=(dev --file compose.yaml --set "${BAKE_CACHE_FROM}")
         if [ -n "${BAKE_CACHE_TO}" ]; then
-          CACHE_TO_ARG="--set ${BAKE_CACHE_TO}"
+          ARGS+=(--set "${BAKE_CACHE_TO}")
         fi
         if [ -n "${BAKE_OUTPUT}" ]; then
-          OUTPUT_ARG="--set ${BAKE_OUTPUT}"
+          ARGS+=(--set "${BAKE_OUTPUT}")
         fi
-        LOAD_ARGS="${BAKE_LOAD_ARGS}"
-        docker buildx bake dev \
-          --file compose.yaml \
-          ${CACHE_FROM_ARG} \
-          ${CACHE_TO_ARG} \
-          ${OUTPUT_ARG} \
-          ${LOAD_ARGS}
+        if [ -n "${BAKE_LOAD_ARGS}" ]; then
+          for token in ${BAKE_LOAD_ARGS}; do
+            ARGS+=("${token}")
+          done
+        fi
+        docker buildx bake "${ARGS[@]}"
 
   lint:
     runs-on: ubuntu-latest
