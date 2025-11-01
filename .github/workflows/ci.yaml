@@ -28,8 +28,8 @@ jobs:
         push: false
         load: true
         set: |
-          dev.cache-from=type=gha,scope=lint
-          dev.cache-to=type=gha,mode=max,scope=lint
+          dev.cache-from=type=gha,scope=ci
+          dev.cache-to=type=gha,mode=max,scope=ci
 
     - name: Check formatting with ruff
       run: |
@@ -65,8 +65,8 @@ jobs:
         push: false
         load: true
         set: |
-          dev.cache-from=type=gha,scope=lint
-          dev.cache-to=type=gha,mode=max,scope=lint
+          dev.cache-from=type=gha,scope=ci
+          dev.cache-to=type=gha,mode=max,scope=ci
 
     - name: Run tests in dev container
       run: |
@@ -103,8 +103,8 @@ jobs:
         push: false
         load: true
         set: |
-          dev.cache-from=type=gha,scope=lint
-          dev.cache-to=type=gha,mode=max,scope=lint
+          dev.cache-from=type=gha,scope=ci
+          dev.cache-to=type=gha,mode=max,scope=ci
 
     - name: Run tests in dev container
       run: |

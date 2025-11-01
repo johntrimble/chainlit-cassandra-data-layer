@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/opt/uv-cache \
 WORKDIR /app
 COPY --from=workspace pyproject.toml ./
 COPY --from=workspace uv.lock* ./
-RUN uv sync --no-install-project --no-dev
+RUN uv sync --no-install-project --all-groups
 WORKDIR /
 
 FROM ${BASE_IMAGE}
