@@ -7,15 +7,15 @@ on:
     branches: [ main, master ]
 
 env:
-  BAKE_LOAD: "true"
-  BAKE_CACHE_TO: ""
+  BAKE_LOAD_ARGS: "--load"
+  BAKE_CACHE_TO_ARGS: ""
 
 jobs:
   build-image:
     runs-on: ubuntu-latest
     env:
-      BAKE_CACHE_TO: dev.cache-to=type=gha,mode=max,scope=ci
-      BAKE_LOAD: "false"
+      BAKE_CACHE_TO_ARGS: "--set dev.cache-to=type=gha,mode=max,scope=ci"
+      BAKE_LOAD_ARGS: ""
 
     steps:
     - &checkout_step
@@ -30,15 +30,20 @@ jobs:
       run: |
         ./script/bootstrap
 
-    - &bake_step
-      name: Build Docker Images
-      uses: docker/bake-action@v6
-      with:
-        source: "."
-        files: "compose.yaml"
-        push: false
-        load: ${{ env.BAKE_LOAD == 'true' }}
-        set: ${{ format('dev.cache-from=type=gha,scope=ci{0}', env.BAKE_CACHE_TO != '' && format('\n{0}', env.BAKE_CACHE_TO) || '') }}
+    - &build_images_step
+      name: Warm cache
+      env:
+        DOCKER_BUILDKIT: 1
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -eux
+        CACHE_ARGS="${BAKE_CACHE_TO_ARGS}"
+        LOAD_ARGS="${BAKE_LOAD_ARGS}"
+        docker buildx bake dev \
+          --file compose.yaml \
+          --set dev.cache-from=type=gha,scope=ci \
+          ${CACHE_ARGS} \
+          ${LOAD_ARGS}
 
   lint:
     runs-on: ubuntu-latest
@@ -51,9 +56,9 @@ jobs:
 
     - *bootstrap_step
 
-    - *bake_step
+    - *build_images_step
 
-    - name: Build images
+    - name: Build images with docker compose
       run: |
         docker compose build dev
 
@@ -81,9 +86,9 @@ jobs:
 
     - *bootstrap_step
 
-    - *bake_step
+    - *build_images_step
 
-    - name: Build images
+    - name: Build images with docker compose
       run: |
         docker compose build
 
@@ -112,9 +117,9 @@ jobs:
 
     - *bootstrap_step
 
-    - *bake_step
+    - *build_images_step
 
-    - name: Build images
+    - name: Build images with docker compose
       run: |
         docker compose build dev
 
