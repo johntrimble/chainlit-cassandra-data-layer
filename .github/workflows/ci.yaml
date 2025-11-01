@@ -46,36 +46,48 @@ jobs:
         load: false
         set: |
           dev.cache-to=type=gha,mode=max,scope=ci
-#   lint:
-#     runs-on: ubuntu-latest
-#     needs: build-image
-#
-#     steps:
-#     - *checkout_step
-#
-#     - *setup_buildx_step
-#
-#     - *bootstrap_step
-#
-#     - *build_images_step
-#
-#     - name: Build images with docker compose
-#       run: |
-#         docker compose build dev
-#
-#     - name: Check formatting with ruff
-#       run: |
-#         docker compose run --rm --no-deps dev ruff format --check .
-#
-#     - name: Lint with ruff
-#       run: |
-#         docker compose run --rm --no-deps dev ruff check .
-#
-#     - name: Cleanup
-#       if: always()
-#       run: |
-#         docker compose down -v
-#
+
+  lint:
+    runs-on: ubuntu-latest
+    needs: build-image
+
+    steps:
+    - *checkout_step
+
+    - *setup_buildx_step
+
+    - *bootstrap_step
+
+    - name: Build from cache & load into daemon
+      uses: docker/bake-action@v6
+      env:
+        BUILDKIT_PROGRESS: plain
+      with:
+        source: .
+        files: compose.yaml
+        targets: dev
+        push: false
+        load: true
+        set: |
+          dev.cache-from=type=gha,scope=ci
+
+    - name: Build images with docker compose
+      run: |
+        docker compose build dev
+
+    - name: Check formatting with ruff
+      run: |
+        docker compose run --rm --no-deps dev ruff format --check .
+
+    - name: Lint with ruff
+      run: |
+        docker compose run --rm --no-deps dev ruff check .
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker compose down -v
+
 #   test:
 #     runs-on: ubuntu-latest
 #     needs: build-image
