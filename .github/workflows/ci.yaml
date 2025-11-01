@@ -6,9 +6,15 @@ on:
   pull_request:
     branches: [ main, master ]
 
+env:
+  COMPOSE_PROJECT_NAME: ci
+
 jobs:
-  lint:
+  build-image:
     runs-on: ubuntu-latest
+
+    outputs:
+      image-artifact: dev-image
 
     steps:
     - uses: actions/checkout@v4
@@ -30,6 +36,41 @@ jobs:
         set: |
           dev.cache-from=type=gha,scope=ci
           dev.cache-to=type=gha,mode=max,scope=ci
+
+    - name: Export dev image
+      run: |
+        docker image save "$(docker compose config --images | grep -m 1 dev)" --output dev-image.tar
+
+    - name: Upload dev image artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dev-image
+        path: dev-image.tar
+        retention-days: 1
+
+  lint:
+    runs-on: ubuntu-latest
+    needs: build-image
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Bootstrap
+      run: |
+        ./script/bootstrap
+
+    - name: Download dev image
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ needs.build-image.outputs.image-artifact }}
+        path: .
+
+    - name: Load dev image
+      run: |
+        docker load --input dev-image/dev-image.tar
 
     - name: Check formatting with ruff
       run: |
@@ -46,6 +87,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    needs: build-image
 
     steps:
     - uses: actions/checkout@v4
@@ -57,16 +99,15 @@ jobs:
       run: |
         ./script/bootstrap
 
-    - name: Build Docker Images
-      uses: docker/bake-action@v6
+    - name: Download dev image
+      uses: actions/download-artifact@v4
       with:
-        source: "."
-        files: "compose.yaml"
-        push: false
-        load: true
-        set: |
-          dev.cache-from=type=gha,scope=ci
-          dev.cache-to=type=gha,mode=max,scope=ci
+        name: ${{ needs.build-image.outputs.image-artifact }}
+        path: .
+
+    - name: Load dev image
+      run: |
+        docker load --input dev-image/dev-image.tar
 
     - name: Run tests in dev container
       run: |
@@ -84,6 +125,7 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
+    needs: build-image
 
     steps:
     - uses: actions/checkout@v4
@@ -95,16 +137,15 @@ jobs:
       run: |
         ./script/bootstrap
 
-    - name: Build Docker Images
-      uses: docker/bake-action@v6
+    - name: Download dev image
+      uses: actions/download-artifact@v4
       with:
-        source: "."
-        files: "compose.yaml"
-        push: false
-        load: true
-        set: |
-          dev.cache-from=type=gha,scope=ci
-          dev.cache-to=type=gha,mode=max,scope=ci
+        name: ${{ needs.build-image.outputs.image-artifact }}
+        path: .
+
+    - name: Load dev image
+      run: |
+        docker load --input dev-image/dev-image.tar
 
     - name: Run tests in dev container
       run: |
