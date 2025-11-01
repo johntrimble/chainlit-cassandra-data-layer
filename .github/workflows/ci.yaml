@@ -48,6 +48,10 @@ jobs:
 
     - *bake_step
 
+    - name: Build images
+      run: |
+        docker compose build dev
+
     - name: Check formatting with ruff
       run: |
         docker compose run --rm --no-deps dev ruff format --check .
@@ -73,6 +77,10 @@ jobs:
     - *bootstrap_step
 
     - *bake_step
+
+    - name: Build images
+      run: |
+        docker compose build
 
     - name: Run tests in dev container
       run: |
@@ -100,6 +108,10 @@ jobs:
     - *bootstrap_step
 
     - *bake_step
+
+    - name: Build images
+      run: |
+        docker compose build dev
 
     - name: Run tests in dev container
       run: |
