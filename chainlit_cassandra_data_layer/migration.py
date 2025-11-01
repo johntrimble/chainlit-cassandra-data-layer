@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from pathlib import Path
 import string
 import time
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
+from pathlib import Path
 
 from cassandra.cluster import Session
 
@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 MIGRATION_LOCK_TTL = 300  # 5 minutes
 MIGRATION_LOCK_KEY = "schema_migration_lock"
+
 
 @dataclass
 class Migration:
@@ -49,7 +50,6 @@ class Migration:
 
 
 class MigrationManager:
-
     def __init__(
         self,
         session: Session,
@@ -203,10 +203,7 @@ class MigrationManager:
 
         logger.debug("Loading default embedded migrations")
 
-        raw_migrations = (
-            migrations_data.get("migration")
-            or []
-        )
+        raw_migrations = migrations_data.get("migration") or []
         migrations = []
 
         for migration_def in raw_migrations:

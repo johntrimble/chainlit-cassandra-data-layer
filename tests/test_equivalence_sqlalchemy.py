@@ -4,18 +4,17 @@ import asyncio
 import copy
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from chainlit.context import context
+from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
+from chainlit.user import User
+from hypothesis import given
 from hypothesis import strategies as st
 from hypothesis.strategies import composite
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-
-from chainlit.context import context
-from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
-from chainlit.user import User
 
 
 @pytest.mark.asyncio
@@ -28,6 +27,7 @@ async def test_update_thread_metadata_name_parity(data_layer, sqlite_data_layer)
         data_layer=data_layer,
         sqlite_data_layer=sqlite_data_layer,
     )
+
 
 @pytest.mark.asyncio
 async def test_update_thread_metadata_no_name_parity(data_layer, sqlite_data_layer):
@@ -44,6 +44,7 @@ async def test_update_thread_metadata_no_name_parity(data_layer, sqlite_data_lay
         data_layer=data_layer,
         sqlite_data_layer=sqlite_data_layer,
     )
+
 
 @pytest.fixture
 def sqlite_data_layer(tmp_path):
@@ -172,9 +173,7 @@ ISO_DATETIME = st.datetimes(
     min_value=datetime(2020, 1, 1),
     max_value=datetime(2030, 12, 31),
 ).map(
-    lambda dt: dt.replace(microsecond=0, tzinfo=timezone.utc)
-    .isoformat()
-    .replace("+00:00", "Z")
+    lambda dt: dt.replace(microsecond=0, tzinfo=UTC).isoformat().replace("+00:00", "Z")
 )
 
 
@@ -324,9 +323,7 @@ def test_cassandra_and_sqlalchemy_equivalence(
 ):
     """Property test: CassandraDataLayer matches SQLAlchemyDataLayer behaviour."""
     asyncio.run(
-        _run_equivalence_sequence(
-            operation_sequence, data_layer, sqlite_data_layer
-        )
+        _run_equivalence_sequence(operation_sequence, data_layer, sqlite_data_layer)
     )
 
 

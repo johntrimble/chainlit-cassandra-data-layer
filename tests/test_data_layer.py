@@ -9,7 +9,6 @@ from chainlit.types import Feedback, PageInfo, Pagination, ThreadFilter
 from chainlit.user import User
 
 
-
 @pytest.mark.asyncio
 class TestUserOperations:
     """Test user-related operations."""
@@ -307,15 +306,21 @@ class TestThreadOperations:
 
         # Verify all results contain "PROJECT" in the name
         for thread in result.data:
-            assert "PROJECT" in thread["name"], f"Thread name '{thread['name']}' should contain 'PROJECT'"
+            assert "PROJECT" in thread["name"], (
+                f"Thread name '{thread['name']}' should contain 'PROJECT'"
+            )
 
         # Verify the thread IDs match our expected matching threads
         result_ids = {thread["id"] for thread in result.data}
         expected_ids = set(matching_thread_ids)
-        assert result_ids == expected_ids, f"Result IDs {result_ids} should match expected {expected_ids}"
+        assert result_ids == expected_ids, (
+            f"Result IDs {result_ids} should match expected {expected_ids}"
+        )
 
         # Verify hasNextPage is False since there are no more matching results
-        assert result.pageInfo.hasNextPage is False, "hasNextPage should be False when no more matching results exist"
+        assert result.pageInfo.hasNextPage is False, (
+            "hasNextPage should be False when no more matching results exist"
+        )
 
         # Clean up
         for thread_id in thread_ids:
@@ -402,12 +407,16 @@ class TestThreadOperations:
 
         # Verify all page 1 results contain "PROJECT"
         for thread in page1.data:
-            assert "PROJECT" in thread["name"], f"Thread name '{thread['name']}' should contain 'PROJECT'"
+            assert "PROJECT" in thread["name"], (
+                f"Thread name '{thread['name']}' should contain 'PROJECT'"
+            )
 
         # Verify page 1 thread IDs match expected
         page1_result_ids = {thread["id"] for thread in page1.data}
         page1_expected_ids = set(page1_thread_ids)
-        assert page1_result_ids == page1_expected_ids, f"Page 1 IDs {page1_result_ids} should match {page1_expected_ids}"
+        assert page1_result_ids == page1_expected_ids, (
+            f"Page 1 IDs {page1_result_ids} should match {page1_expected_ids}"
+        )
 
         # Verify hasNextPage is True
         assert page1.pageInfo.hasNextPage is True, "Page 1 hasNextPage should be True"
@@ -419,7 +428,9 @@ class TestThreadOperations:
         # This shows us what raw position the cursor points to in the database
         pagination2_no_filter = Pagination(first=5, cursor=page1.pageInfo.endCursor)
         filters_no_search = ThreadFilter(userId=persisted_user.id)
-        page2_no_filter = await data_layer.list_threads(pagination2_no_filter, filters_no_search)
+        page2_no_filter = await data_layer.list_threads(
+            pagination2_no_filter, filters_no_search
+        )
 
         # The cursor should position us close to the next matching thread
         # If we're rescanning, we'd get many "Discussion Between" threads
@@ -435,8 +446,12 @@ class TestThreadOperations:
 
         # PROJECT Beta should appear very early (ideally at position 0 or 1)
         # If we were rescanning all 21 "Discussion Between" threads, it wouldn't appear in first 5
-        assert project_beta_position is not None, "PROJECT Beta should appear in first 5 results after cursor"
-        assert project_beta_position <= 1, f"PROJECT Beta at position {project_beta_position} - cursor should skip non-matches (position should be 0 or 1)"
+        assert project_beta_position is not None, (
+            "PROJECT Beta should appear in first 5 results after cursor"
+        )
+        assert project_beta_position <= 1, (
+            f"PROJECT Beta at position {project_beta_position} - cursor should skip non-matches (position should be 0 or 1)"
+        )
 
         # Now request page 2 WITH search filter
         pagination2 = Pagination(first=5, cursor=page1.pageInfo.endCursor)
@@ -446,14 +461,20 @@ class TestThreadOperations:
         assert len(page2.data) == 1, f"Page 2 expected 1 result, got {len(page2.data)}"
 
         # Verify the page 2 result contains "PROJECT"
-        assert "PROJECT" in page2.data[0]["name"], f"Thread name '{page2.data[0]['name']}' should contain 'PROJECT'"
+        assert "PROJECT" in page2.data[0]["name"], (
+            f"Thread name '{page2.data[0]['name']}' should contain 'PROJECT'"
+        )
 
         # Verify page 2 thread ID matches expected
         page2_result_id = page2.data[0]["id"]
-        assert page2_result_id == page2_thread_ids[0], f"Page 2 ID {page2_result_id} should match {page2_thread_ids[0]}"
+        assert page2_result_id == page2_thread_ids[0], (
+            f"Page 2 ID {page2_result_id} should match {page2_thread_ids[0]}"
+        )
 
         # Verify hasNextPage is False
-        assert page2.pageInfo.hasNextPage is False, "Page 2 hasNextPage should be False when no more matching results exist"
+        assert page2.pageInfo.hasNextPage is False, (
+            "Page 2 hasNextPage should be False when no more matching results exist"
+        )
 
         # Clean up
         for thread_id in thread_ids:
@@ -637,6 +658,7 @@ class TestStepOperations:
         # Set context for delete_step (it needs context.session.thread_id)
         from chainlit.context import context
         from chainlit.session import BaseSession
+
         if not context.session:
             context.session = BaseSession()
         context.session.thread_id = test_thread_id
@@ -680,6 +702,7 @@ class TestFeedbackOperations:
         # Set context for feedback operations (they need context.session.thread_id)
         from chainlit.context import context
         from chainlit.session import BaseSession
+
         if not context.session:
             context.session = BaseSession()
         context.session.thread_id = test_thread_id
@@ -729,6 +752,7 @@ class TestFeedbackOperations:
         # Set context for feedback operations (they need context.session.thread_id)
         from chainlit.context import context
         from chainlit.session import BaseSession
+
         if not context.session:
             context.session = BaseSession()
         context.session.thread_id = test_thread_id
