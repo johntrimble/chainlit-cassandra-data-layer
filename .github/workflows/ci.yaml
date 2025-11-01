@@ -9,6 +9,8 @@ on:
 jobs:
   build-image:
     runs-on: ubuntu-latest
+    env:
+      BAKE_CACHE_TO: dev.cache-to=type=gha,mode=max,scope=ci
 
     steps:
     - &checkout_step
@@ -31,9 +33,7 @@ jobs:
         files: "compose.yaml"
         push: false
         load: true
-        set: |
-          dev.cache-from=type=gha,scope=ci
-          dev.cache-to=type=gha,mode=max,scope=ci
+        set: ${{ format('dev.cache-from=type=gha,scope=ci{0}', env.BAKE_CACHE_TO != '' && format('\n{0}', env.BAKE_CACHE_TO) || '') }}
 
   lint:
     runs-on: ubuntu-latest
@@ -103,7 +103,7 @@ jobs:
 
     - name: Run tests in dev container
       run: |
-        docker compose run --rm dev mypy
+        docker compose run --no-deps --rm dev mypy
 
     - name: Show Cassandra logs on failure
       if: failure()
