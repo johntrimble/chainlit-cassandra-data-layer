@@ -14,7 +14,7 @@ jobs:
   build-image:
     runs-on: ubuntu-latest
     env:
-      BAKE_CACHE_TO_ARGS: "--set dev.cache-to=type=gha,mode=max,scope=ci"
+      BAKE_CACHE_TO_ARGS: "--set *.cache-to=type=gha,mode=max,scope=ci --set *.output=type=cacheonly"
       BAKE_LOAD_ARGS: ""
 
     steps:
@@ -41,7 +41,7 @@ jobs:
         LOAD_ARGS="${BAKE_LOAD_ARGS}"
         docker buildx bake dev \
           --file compose.yaml \
-          --set dev.cache-from=type=gha,scope=ci \
+          --set "*.cache-from=type=gha,scope=ci" \
           ${CACHE_ARGS} \
           ${LOAD_ARGS}
 
