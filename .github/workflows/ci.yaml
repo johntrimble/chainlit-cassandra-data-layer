@@ -52,7 +52,102 @@ jobs:
             ARGS+=("${token}")
           done
         fi
+        ARGS+=(--progress=plain --metadata-file build-metadata.json)
         docker buildx bake "${ARGS[@]}"
+        echo "--- buildx metadata (build-image) ---"
+        cat build-metadata.json || true
+
+#   lint:
+#     runs-on: ubuntu-latest
+#     needs: build-image
+#
+#     steps:
+#     - *checkout_step
+#
+#     - *setup_buildx_step
+#
+#     - *bootstrap_step
+#
+#     - *build_images_step
+#
+#     - name: Build images with docker compose
+#       run: |
+#         docker compose build dev
+#
+#     - name: Check formatting with ruff
+#       run: |
+#         docker compose run --rm --no-deps dev ruff format --check .
+#
+#     - name: Lint with ruff
+#       run: |
+#         docker compose run --rm --no-deps dev ruff check .
+#
+#     - name: Cleanup
+#       if: always()
+#       run: |
+#         docker compose down -v
+#
+#   test:
+#     runs-on: ubuntu-latest
+#     needs: build-image
+#
+#     steps:
+#     - *checkout_step
+#
+#     - *setup_buildx_step
+#
+#     - *bootstrap_step
+#
+#     - *build_images_step
+#
+#     - name: Build images with docker compose
+#       run: |
+#         docker compose build
+#
+#     - name: Run tests in dev container
+#       run: |
+#         docker compose run --rm dev pytest tests/ -v
+#
+#     - name: Show Cassandra logs on failure
+#       if: failure()
+#       run: |
+#         docker compose logs cassandra
+#
+#     - name: Cleanup
+#       if: always()
+#       run: |
+#         docker compose down -v
+#
+#   typecheck:
+#     runs-on: ubuntu-latest
+#     needs: build-image
+#
+#     steps:
+#     - *checkout_step
+#
+#     - *setup_buildx_step
+#
+#     - *bootstrap_step
+#
+#     - *build_images_step
+#
+#     - name: Build images with docker compose
+#       run: |
+#         docker compose build dev
+#
+#     - name: Run tests in dev container
+#       run: |
+#         docker compose run --no-deps --rm dev mypy
+#
+#     - name: Show Cassandra logs on failure
+#       if: failure()
+#       run: |
+#         docker compose logs cassandra
+#
+#     - name: Cleanup
+#       if: always()
+#       run: |
+#         docker compose down -v
 
   lint:
     runs-on: ubuntu-latest
