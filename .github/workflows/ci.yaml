@@ -8,13 +8,16 @@ on:
 
 env:
   BAKE_LOAD_ARGS: "--load"
-  BAKE_CACHE_TO_ARGS: ""
+  BAKE_CACHE_FROM: "*.cache-from=type=gha,scope=ci"
+  BAKE_CACHE_TO: ""
+  BAKE_OUTPUT: ""
 
 jobs:
   build-image:
     runs-on: ubuntu-latest
     env:
-      BAKE_CACHE_TO_ARGS: "--set *.cache-to=type=gha,mode=max,scope=ci --set *.output=type=cacheonly"
+      BAKE_CACHE_TO: "*.cache-to=type=gha,mode=max,scope=ci"
+      BAKE_OUTPUT: "*.output=type=cacheonly"
       BAKE_LOAD_ARGS: ""
 
     steps:
@@ -37,12 +40,21 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -eux
-        CACHE_ARGS="${BAKE_CACHE_TO_ARGS}"
+        CACHE_FROM_ARG="--set ${BAKE_CACHE_FROM}"
+        CACHE_TO_ARG=""
+        OUTPUT_ARG=""
+        if [ -n "${BAKE_CACHE_TO}" ]; then
+          CACHE_TO_ARG="--set ${BAKE_CACHE_TO}"
+        fi
+        if [ -n "${BAKE_OUTPUT}" ]; then
+          OUTPUT_ARG="--set ${BAKE_OUTPUT}"
+        fi
         LOAD_ARGS="${BAKE_LOAD_ARGS}"
         docker buildx bake dev \
           --file compose.yaml \
-          --set "*.cache-from=type=gha,scope=ci" \
-          ${CACHE_ARGS} \
+          ${CACHE_FROM_ARG} \
+          ${CACHE_TO_ARG} \
+          ${OUTPUT_ARG} \
           ${LOAD_ARGS}
 
   lint:
