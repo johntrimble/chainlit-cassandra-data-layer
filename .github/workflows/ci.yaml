@@ -6,11 +6,14 @@ on:
   pull_request:
     branches: [ main, master ]
 
+env:
+  BAKE_CACHE_TO_FLAGS: ""
+
 jobs:
   build-image:
     runs-on: ubuntu-latest
     env:
-      BAKE_CACHE_TO: dev.cache-to=type=gha,mode=max,scope=ci
+      BAKE_CACHE_TO_FLAGS: --set dev.cache-to=type=gha,mode=max,scope=ci
 
     steps:
     - &checkout_step
@@ -25,15 +28,14 @@ jobs:
       run: |
         ./script/bootstrap
 
-    - &bake_step
-      name: Build Docker Images
-      uses: docker/bake-action@v6
-      with:
-        source: "."
-        files: "compose.yaml"
-        push: false
-        load: true
-        set: ${{ format('dev.cache-from=type=gha,scope=ci{0}', env.BAKE_CACHE_TO != '' && format('\n{0}', env.BAKE_CACHE_TO) || '') }}
+    - &build_dev_image_step
+      name: Build dev image
+      run: |
+        EXTRA_ARGS="${BAKE_CACHE_TO_FLAGS}"
+        docker buildx bake dev \
+          --file compose.yaml \
+          --load \
+          --set dev.cache-from=type=gha,scope=ci ${EXTRA_ARGS}
 
   lint:
     runs-on: ubuntu-latest
@@ -46,15 +48,15 @@ jobs:
 
     - *bootstrap_step
 
-    - *bake_step
+    - *build_dev_image_step
 
     - name: Check formatting with ruff
       run: |
-        docker compose run --rm --no-deps dev ruff format --check .
+        docker compose run --rm --no-deps --no-build dev ruff format --check .
 
     - name: Lint with ruff
       run: |
-        docker compose run --rm --no-deps dev ruff check .
+        docker compose run --rm --no-deps --no-build dev ruff check .
 
     - name: Cleanup
       if: always()
@@ -72,11 +74,11 @@ jobs:
 
     - *bootstrap_step
 
-    - *bake_step
+    - *build_dev_image_step
 
     - name: Run tests in dev container
       run: |
-        docker compose run --rm dev pytest tests/ -v
+        docker compose run --rm --no-build dev pytest tests/ -v
 
     - name: Show Cassandra logs on failure
       if: failure()
@@ -99,11 +101,11 @@ jobs:
 
     - *bootstrap_step
 
-    - *bake_step
+    - *build_dev_image_step
 
     - name: Run tests in dev container
       run: |
-        docker compose run --no-deps --rm dev mypy
+        docker compose run --no-deps --rm --no-build dev mypy
 
     - name: Show Cassandra logs on failure
       if: failure()
