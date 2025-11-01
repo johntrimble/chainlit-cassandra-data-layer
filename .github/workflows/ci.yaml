@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Bootstrap
+      run: |
+        ./script/bootstrap
+
+    - name: Build Docker Images
+      uses: docker/bake-action@v6
+      with:
+        source: "."
+        files: "compose.yaml"
+        push: false
+        load: true
+        set: |
+          dev.cache-from=type=gha,scope=lint
+          dev.cache-to=type=gha,mode=max,scope=lint
+
+    - name: Check formatting with ruff
+      run: |
+        docker compose run --rm --no-deps dev ruff format --check .
+
+    - name: Lint with ruff
+      run: |
+        docker compose run --rm --no-deps dev ruff check .
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker compose down -v
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Bootstrap
+      run: |
+        ./script/bootstrap
+
+    - name: Build Docker Images
+      uses: docker/bake-action@v6
+      with:
+        source: "."
+        files: "compose.yaml"
+        push: false
+        load: true
+        set: |
+          dev.cache-from=type=gha,scope=lint
+          dev.cache-to=type=gha,mode=max,scope=lint
+
+    - name: Run tests in dev container
+      run: |
+        docker compose run --rm dev pytest tests/ -v
+
+    - name: Show Cassandra logs on failure
+      if: failure()
+      run: |
+        docker compose logs cassandra
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker compose down -v
+
+  typecheck:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Bootstrap
+      run: |
+        ./script/bootstrap
+
+    - name: Build Docker Images
+      uses: docker/bake-action@v6
+      with:
+        source: "."
+        files: "compose.yaml"
+        push: false
+        load: true
+        set: |
+          dev.cache-from=type=gha,scope=lint
+          dev.cache-to=type=gha,mode=max,scope=lint
+
+    - name: Run tests in dev container
+      run: |
+        docker compose run --rm dev mypy
+
+    - name: Show Cassandra logs on failure
+      if: failure()
+      run: |
+        docker compose logs cassandra
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker compose down -v
