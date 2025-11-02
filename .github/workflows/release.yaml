@@ -1,0 +1,76 @@
+name: Publish Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - testpypi
+          - pypi
+      tag:
+        description: 'Git tag to release (e.g., v0.1.0)'
+        required: true
+        type: string
+
+jobs:
+  release:
+    name: Publish to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv and setup the python version
+        uses: astral-sh/setup-uv@v5
+
+      - name: Validate version matches tag
+        run: |
+          # Extract version from pyproject.toml
+          PROJECT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+
+          # Strip 'v' prefix from tag
+          TAG_VERSION="${{ inputs.tag }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+
+          echo "Project version: $PROJECT_VERSION"
+          echo "Tag version: $TAG_VERSION"
+
+          if [ "$PROJECT_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Error: Version mismatch!"
+            echo "Project version ($PROJECT_VERSION) does not match tag version ($TAG_VERSION)"
+            exit 1
+          fi
+
+          echo "✅ Version validation passed"
+
+      - name: Install the project
+        run: uv sync --all-groups
+
+      - name: Build wheel
+        run: uv build
+
+      - name: List dist files
+        run: ls -la dist/
+
+      - name: Publish to ${{ inputs.environment }}
+        run: |
+          if [ "${{ inputs.environment }}" == "testpypi" ]; then
+            uv publish --index testpypi
+          else
+            uv publish
+          fi
