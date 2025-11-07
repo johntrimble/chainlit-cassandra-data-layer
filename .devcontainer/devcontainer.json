@@ -18,9 +18,9 @@
     "source=${localEnv:SSH_AUTH_SOCK},target=/tmp/ssh-agent.sock,type=bind"
   ],
 
-  // Environment variables for SSH agent forwarding
   "remoteEnv": {
-    "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock"
+    "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+    "TERM": "xterm-256color"
   },
 
   // VS Code specific customizations.

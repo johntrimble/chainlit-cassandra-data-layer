@@ -1,3 +1,7 @@
+"""
+Migration system for Cassandra checkpoint saver.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -5,17 +9,21 @@ import logging
 import string
 import time
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 from cassandra.cluster import Session
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_KEYSPACE = "chainlit"
 MIGRATION_LOCK_TTL = 300  # 5 minutes
 MIGRATION_LOCK_KEY = "schema_migration_lock"
+BASE_MODULE_NAME = "chainlit_cassandra_data_layer"
 
 
 @dataclass
@@ -28,32 +36,26 @@ class Migration:
     checksum: str
     statements: list[str]
 
-    @classmethod
-    def from_dict(cls, migration_def: dict) -> Migration:
-        """Create a Migration from a dictionary definition."""
-        version = migration_def["version"]
-        name = migration_def.get("name", f"migration_{version}")
-        description = migration_def.get("description", "")
-        statements = migration_def.get("statements", [])
 
-        # Calculate checksum from statements
-        content = "\n".join(statements)
-        checksum = hashlib.sha256(content.encode()).hexdigest()
+def _compute_migration_checksum(statements: list[str]) -> str:
+    """
+    Compute a SHA256 checksum for migration statements.
 
-        return cls(
-            version=version,
-            name=name,
-            description=description,
-            checksum=checksum,
-            statements=statements,
-        )
+    Args:
+        statements: List of SQL statements (should be raw templates, not formatted)
+
+    Returns:
+        Hexadecimal checksum string
+    """
+    content = "\n".join(statements)
+    return hashlib.sha256(content.encode()).hexdigest()
 
 
 class MigrationManager:
     def __init__(
         self,
         session: Session,
-        keyspace: str | None = None,
+        keyspace: str = DEFAULT_KEYSPACE,
         replication_factor: int = 3,
     ):
         """
@@ -63,6 +65,8 @@ class MigrationManager:
             session: Cassandra session
             keyspace: Keyspace name (defaults to session's keyspace)
             replication_factor: Replication factor for the keyspace (default: 3, use 1 for single-node clusters)
+            checkpoint_id_type: Type for checkpoint_id column ("uuid" [default], "text")
+            thread_id_type: Type for thread_id column ("uuid" [default], "text")
         """
         self.session = session
         self.keyspace = keyspace if keyspace is not None else session.keyspace
@@ -72,7 +76,13 @@ class MigrationManager:
                 "Provide one explicitly or connect the session to a keyspace."
             )
         self.replication_factor = replication_factor
-        self.migrations: list[Migration] = self._load_migrations()
+        self.migrations: list[Migration] = self._load_migrations(
+            migrations_template=self._get_default_migrations_template(),
+            template_params={
+                "keyspace": self.keyspace,
+                "replication_factor": replication_factor,
+            },
+        )
 
     def _ensure_migration_tables(self) -> None:
         """Ensure the migration tracking tables exist."""
@@ -152,7 +162,7 @@ class MigrationManager:
             return {row.version for row in result}
         except Exception as e:
             logger.debug(f"Could not get applied migrations: {e}")
-            return set()
+            raise
 
     def _record_migration(
         self,
@@ -178,13 +188,7 @@ class MigrationManager:
             ),
         )
 
-    def _load_migrations(self) -> list[Migration]:
-        """
-        Load default embedded migrations.
-
-        Migrations are defined in DEFAULT_MIGRATIONS and automatically
-        formatted with keyspace name and column types.
-        """
+    def _get_default_migrations_template(self) -> Any:
         migrations_path = Path(__file__).with_name("migrations.toml")
         if migrations_path.is_file():
             with migrations_path.open("rb") as fp:
@@ -192,7 +196,7 @@ class MigrationManager:
         else:
             try:
                 migrations_resource = resources.files(
-                    "chainlit_cassandra_data_layer"
+                    BASE_MODULE_NAME
                 ).joinpath("migrations.toml")
             except FileNotFoundError as exc:  # pragma: no cover - defensive
                 raise FileNotFoundError(
@@ -200,24 +204,45 @@ class MigrationManager:
                 ) from exc
             with migrations_resource.open("rb") as fp:
                 migrations_data = tomllib.load(fp)
+        return migrations_data
 
+    def _load_migrations(
+        self, migrations_template: Any, template_params: Mapping
+    ) -> list[Migration]:
+        """
+        Load default embedded migrations.
+
+        Migrations are defined in DEFAULT_MIGRATIONS and automatically
+        formatted with keyspace name and column types.
+        """
         logger.debug("Loading default embedded migrations")
 
-        raw_migrations = migrations_data.get("migration") or []
+        raw_migrations = migrations_template.get("migration") or []
         migrations = []
 
         for migration_def in raw_migrations:
             if "statements" in migration_def:
-                formatted_statements = [
-                    string.Template(stmt).safe_substitute(
-                        keyspace=self.keyspace,
-                        replication_factor=self.replication_factor,
-                    )
-                    for stmt in migration_def["statements"]
-                ]
-                migration_def = {**migration_def, "statements": formatted_statements}
+                # Keep raw statements for checksum calculation
+                raw_statements = migration_def["statements"]
 
-            migration = Migration.from_dict(migration_def)
+                # Format statements for execution
+                formatted_statements = [
+                    string.Template(stmt).safe_substitute(**template_params)
+                    for stmt in raw_statements
+                ]
+
+                checksum = _compute_migration_checksum(formatted_statements)
+
+                # Create modified migration_def with formatted statements
+                formatted_migration_def = {
+                    **migration_def,
+                    "statements": formatted_statements,
+                }
+            else:
+                checksum = ""
+                formatted_migration_def = migration_def
+
+            migration = Migration(**formatted_migration_def, checksum=checksum)
             migrations.append(migration)
 
         # Sort by version
@@ -289,14 +314,14 @@ class MigrationManager:
         # Ensure migration tables exist
         self._ensure_migration_tables()
 
-        # Get pending migrations
+        # Get pending migrations (initial check)
         pending = self.get_pending_migrations()
 
         if not pending:
             logger.info("No pending migrations")
             return 0
 
-        logger.info(f"Found {len(pending)} pending migrations")
+        logger.info(f"Found {len(pending)} pending migration(s)")
 
         # Try to acquire lock with retry
         start_wait = time.time()
@@ -315,11 +340,21 @@ class MigrationManager:
             )
 
         try:
+            # Re-check pending migrations after acquiring lock
+            # (another process may have applied them while we waited)
+            pending = self.get_pending_migrations()
+
+            if not pending:
+                logger.info(
+                    "No pending migrations (already applied by another process)"
+                )
+                return 0
+
             # Apply migrations
             for migration in pending:
                 self.apply_migration(migration)
 
-            logger.info(f"Successfully applied {len(pending)} migrations")
+            logger.info(f"Successfully applied {len(pending)} migration(s)")
             return len(pending)
 
         finally:

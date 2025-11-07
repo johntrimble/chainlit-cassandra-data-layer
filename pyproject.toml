@@ -36,6 +36,34 @@ dev = [
     "mypy>=1.18.2",
 ]
 
+[tool.tox.env_run_base]
+package = "wheel"                 # build wheel via your uv_build backend
+wheel_build_env = ".pkg"
+dependency_groups = ["dev"]
+changedir = "{envtmpdir}"         # run *outside* your repo
+setenv = { PYTHONSAFEPATH = "1" } # don't prepend CWD to sys.path
+
+# Copy tests into the temp dir before running (portable Python one-liner)
+commands_pre = [
+  [
+    "python",
+    "-c",
+    "import shutil,sys; shutil.rmtree(sys.argv[2], ignore_errors=True); shutil.copytree(sys.argv[1], sys.argv[2]); print('Copied tests to', sys.argv[2])",
+    "{toxinidir}/tests",
+    "{envtmpdir}/tests"
+  ]
+]
+
+# Sanity-check we import from site-packages, then run pytest
+commands = [
+  [
+    "python",
+    "-c",
+    "import inspect,chainlit_cassandra_data_layer as p; pth=inspect.getfile(p); print('Imported from:', pth); assert 'site-packages' in pth, pth"
+  ],
+  ["pytest", "-q", "--import-mode=importlib", "tests"]
+]
+
 [tool.ruff]
 lint.select = [
   "E",  # pycodestyle
