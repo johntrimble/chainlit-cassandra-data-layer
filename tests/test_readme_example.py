@@ -1,4 +1,3 @@
-import asyncio
 import os
 import re
 from pathlib import Path
@@ -40,6 +39,7 @@ async def test_readme_usage_example():
 
     # Verify the data layer was set up correctly
     from chainlit.data import get_data_layer
+
     from chainlit_cassandra_data_layer.data import CassandraDataLayer
 
     data_layer = get_data_layer()
