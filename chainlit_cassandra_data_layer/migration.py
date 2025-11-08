@@ -195,9 +195,9 @@ class MigrationManager:
                 migrations_data = tomllib.load(fp)
         else:
             try:
-                migrations_resource = resources.files(
-                    BASE_MODULE_NAME
-                ).joinpath("migrations.toml")
+                migrations_resource = resources.files(BASE_MODULE_NAME).joinpath(
+                    "migrations.toml"
+                )
             except FileNotFoundError as exc:  # pragma: no cover - defensive
                 raise FileNotFoundError(
                     "migrations.toml not found alongside package or in resources"

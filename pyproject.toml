@@ -45,12 +45,21 @@ setenv = { PYTHONSAFEPATH = "1" } # don't prepend CWD to sys.path
 
 # Copy tests into the temp dir before running (portable Python one-liner)
 commands_pre = [
+  # Copy tests directory
   [
     "python",
     "-c",
     "import shutil,sys; shutil.rmtree(sys.argv[2], ignore_errors=True); shutil.copytree(sys.argv[1], sys.argv[2]); print('Copied tests to', sys.argv[2])",
     "{toxinidir}/tests",
     "{envtmpdir}/tests"
+  ],
+  # Copy over README.md (needed for one of our tests)
+  [
+    "python",
+    "-c",
+    "import shutil,sys; shutil.copy2(sys.argv[1], sys.argv[2]); print('Copied README.md to', sys.argv[2])",
+    "{toxinidir}/README.md",
+    "{envtmpdir}/README.md"
   ]
 ]
 
