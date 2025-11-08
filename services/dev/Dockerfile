@@ -1,3 +1,4 @@
+ARG PYTHON_VERSION=3.12
 ARG BASE_IMAGE=ubuntu:24.04
 
 FROM ${BASE_IMAGE} AS builder
@@ -7,30 +8,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl build-essential pkg-config git \
  && rm -rf /var/lib/apt/lists/*
 
+# Install Python
+# Add Deadsnakes and install Python 3.12 + venv/dev headers
+ARG PYTHON_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg software-properties-common \
+  && add-apt-repository -y ppa:deadsnakes/ppa \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends \
+      python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev \
+  && rm -rf /var/lib/apt/lists/*
+
 # Install uv
-COPY --from=ghcr.io/astral-sh/uv:0.8.24 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /uvx /bin/
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_TOOL_BIN_DIR=/opt/uv-bin/ \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_CACHE_DIR=/opt/uv-cache/ \
     UV_PYTHON_INSTALL_DIR=/python \
-    UV_PYTHON_PREFERENCE=only-managed
+    UV_PYTHON_PREFERENCE=only-system
 RUN mkdir -p ${UV_TOOL_BIN_DIR} ${UV_PYTHON_CACHE_DIR}
 
-# Install Python using uv
-ARG PYTHON_VERSION=3.12
-RUN --mount=type=cache,target=/opt/uv-cache \
-    uv python install ${PYTHON_VERSION}
-
 # Install project dependencies
-WORKDIR /app
+WORKDIR /workspace
 COPY --from=workspace pyproject.toml ./
 COPY --from=workspace uv.lock* ./
-RUN uv sync --no-install-project --all-groups
+RUN uv sync --python /usr/bin/python${PYTHON_VERSION} --no-install-project
 WORKDIR /
 
 FROM ${BASE_IMAGE}
+
+# Install Python
+# Add Deadsnakes and install Python 3.12 + venv/dev headers
+ARG PYTHON_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg software-properties-common \
+  && add-apt-repository -y ppa:deadsnakes/ppa \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends \
+      python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 # Install useful packages
 RUN apt-get update && \
@@ -100,21 +118,18 @@ RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhisto
   && chown -R $USERNAME:$USERNAME /commandhistory
 
 # Install uv
-COPY --from=ghcr.io/astral-sh/uv:0.8.24 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /uvx /bin/
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_TOOL_BIN_DIR=/opt/uv-bin/ \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_CACHE_DIR=/opt/uv-cache/ \
     UV_PYTHON_INSTALL_DIR=/python \
-    UV_PYTHON_PREFERENCE=only-managed
+    UV_PYTHON_PREFERENCE=only-system
 
 USER ${USERNAME}
 RUN ["/bin/bash", "-c", "mkdir /home/${USERNAME}/.claude && set -o pipefail && curl -fsSL https://claude.ai/install.sh | bash"]
 USER root
-
-# Copy over python
-COPY --from=builder --chown=${USERNAME}:${USERNAME} /python /python
 
 # Copy over virtualenv
 COPY --from=builder --chown=${USERNAME}:${USERNAME} /opt/venv /opt/venv
