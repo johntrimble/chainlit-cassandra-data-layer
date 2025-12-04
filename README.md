@@ -21,7 +21,7 @@ import os
 
 import chainlit as cl
 from cassandra_asyncio.cluster import Cluster
-from chainlit_cassandra_data_layer.data import CassandraDataLayer
+from chainlit_cassandra_data_layer import CassandraDataLayer
 
 @cl.data_layer
 def configure_data_layer() -> CassandraDataLayer:
