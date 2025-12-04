@@ -480,6 +480,90 @@ class TestThreadOperations:
         for thread_id in thread_ids:
             await data_layer.delete_thread(thread_id)
 
+    async def test_list_threads_handles_all_duplicate_batch(
+        self, data_layer, test_user_id
+    ):
+        """Test that list_threads doesn't hang when a batch contains only duplicates.
+
+        Reproduces bug: https://github.com/johntrimble/chainlit-cassandra-data-layer/issues/6
+
+        Setup: Create threads and manually insert duplicate entries in threads_by_user_activity
+        Expected: list_threads completes without hanging (cursor should advance even with empty unique_rows)
+        """
+        # Create user
+        user = User(identifier=test_user_id, metadata={})
+        persisted_user = await data_layer.create_user(user)
+        user_id_uuid = uuid.UUID(persisted_user.id)
+
+        thread_ids = []
+
+        # Create several threads that will appear in the first batch
+        for i in range(5):
+            thread_id = str(uuid.uuid4())
+            thread_ids.append(thread_id)
+            await data_layer.update_thread(
+                thread_id=thread_id,
+                name=f"Thread {i}",
+                user_id=persisted_user.id,
+            )
+            await asyncio.sleep(0.01)
+
+        # Now manually insert duplicate entries for the first 3 threads
+        # These duplicates will have older timestamps, so they'll appear in later batches
+        # when those batches are fetched, all rows will be duplicates of already-seen threads
+        from datetime import datetime as dt, timedelta
+
+        for i in range(3):
+            thread_id_uuid = uuid.UUID(thread_ids[i])
+
+            # Insert multiple old duplicates for this thread
+            for j in range(25):  # Create enough duplicates to fill a batch
+                old_timestamp = dt.now() - timedelta(hours=1 + j)
+
+                insert_query = f"""
+                    INSERT INTO {data_layer._table_threads_by_user_activity}
+                    (user_id, last_activity_at, thread_id, thread_name, thread_created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                """
+                await data_layer._aexecute_prepared(
+                    insert_query,
+                    (
+                        user_id_uuid,
+                        old_timestamp,
+                        thread_id_uuid,
+                        f"Thread {i}",
+                        dt.now(),
+                    ),
+                )
+
+        # Now try to list threads with a small page size
+        # The first batch will contain the 5 newest entries (one per thread)
+        # Subsequent batches will contain only duplicates of threads already seen
+        # With the bug: this will hang forever as cursor doesn't advance on duplicate-only batches
+        # Without the bug: this should complete and return results
+        pagination = Pagination(first=10)
+        filters = ThreadFilter(userId=persisted_user.id)
+
+        # This should complete without hanging - use asyncio.wait_for to enforce timeout
+        # If it takes longer than 10 seconds, the bug is present
+        try:
+            result = await asyncio.wait_for(
+                data_layer.list_threads(pagination, filters), timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "list_threads hung for more than 10 seconds - infinite loop bug is present. "
+                "Cursor is not advancing when all rows in a batch are duplicates."
+            )
+
+        # Verify we got results
+        assert len(result.data) > 0
+        assert result.pageInfo is not None
+
+        # Clean up
+        for thread_id in thread_ids:
+            await data_layer.delete_thread(thread_id)
+
 
 @pytest.mark.asyncio
 class TestStepOperations:

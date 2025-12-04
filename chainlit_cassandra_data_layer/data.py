@@ -1299,8 +1299,8 @@ class CassandraDataLayer(BaseDataLayer):
                 found_extra_match = True
 
             # Update cursor to last row for next iteration
-            if unique_rows:
-                last_row = unique_rows[-1]
+            if rows:
+                last_row = rows[-1]
                 current_cursor_timestamp = last_row.last_activity_at
                 current_cursor_thread_id = last_row.thread_id
 
