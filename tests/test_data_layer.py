@@ -550,7 +550,7 @@ class TestThreadOperations:
             result = await asyncio.wait_for(
                 data_layer.list_threads(pagination, filters), timeout=10.0
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail(
                 "list_threads hung for more than 10 seconds - infinite loop bug is present. "
                 "Cursor is not advancing when all rows in a batch are duplicates."
