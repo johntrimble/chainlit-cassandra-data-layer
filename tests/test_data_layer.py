@@ -511,7 +511,8 @@ class TestThreadOperations:
         # Now manually insert duplicate entries for the first 3 threads
         # These duplicates will have older timestamps, so they'll appear in later batches
         # when those batches are fetched, all rows will be duplicates of already-seen threads
-        from datetime import datetime as dt, timedelta
+        from datetime import datetime as dt
+        from datetime import timedelta
 
         for i in range(3):
             thread_id_uuid = uuid.UUID(thread_ids[i])
