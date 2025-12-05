@@ -89,5 +89,13 @@ statements = [
     created_at TIMESTAMP,
     PRIMARY KEY (thread_id, id)
   );
+  """,
+  """
+  CREATE TABLE IF NOT EXISTS ${keyspace}.step_activity_by_thread (
+    thread_id UUID,
+    created_at TIMESTAMP,
+    step_id UUID,
+    PRIMARY KEY (thread_id, created_at, step_id)
+  ) WITH CLUSTERING ORDER BY (created_at DESC, step_id ASC);
   """
 ]

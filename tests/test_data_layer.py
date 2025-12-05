@@ -149,7 +149,7 @@ class TestThreadOperations:
         user = User(identifier=test_user_id, metadata={})
         persisted_user = await data_layer.create_user(user)
 
-        # Create multiple threads
+        # Create multiple threads with steps (needed for activity tracking)
         thread_ids = []
         for i in range(3):
             thread_id = str(uuid.uuid4())  # Generate valid UUID string
@@ -158,6 +158,16 @@ class TestThreadOperations:
                 thread_id=thread_id,
                 name=f"Thread {i}",
                 user_id=persisted_user.id,
+            )
+            # Create a step to trigger activity tracking
+            step_id = str(uuid.uuid4())
+            await data_layer.create_step(
+                {
+                    "id": step_id,
+                    "threadId": thread_id,
+                    "type": "user_message",
+                    "output": f"Message {i}",
+                }
             )
 
         # List threads
@@ -266,6 +276,16 @@ class TestThreadOperations:
                 name=f"Discussion Thread {i}",
                 user_id=persisted_user.id,
             )
+            # Create a step to trigger activity tracking
+            step_id = str(uuid.uuid4())
+            await data_layer.create_step(
+                {
+                    "id": step_id,
+                    "threadId": thread_id,
+                    "type": "user_message",
+                    "output": f"Message {i}",
+                }
+            )
             # Small delay to ensure ordering by activity time
             await asyncio.sleep(0.01)
 
@@ -281,6 +301,16 @@ class TestThreadOperations:
                 name=f"PROJECT Alpha {i}",
                 user_id=persisted_user.id,
             )
+            # Create a step to trigger activity tracking
+            step_id = str(uuid.uuid4())
+            await data_layer.create_step(
+                {
+                    "id": step_id,
+                    "threadId": thread_id,
+                    "type": "user_message",
+                    "output": f"PROJECT Message {i}",
+                }
+            )
             await asyncio.sleep(0.01)
 
         # Create 20 more threads that DON'T match
@@ -292,6 +322,16 @@ class TestThreadOperations:
                 thread_id=thread_id,
                 name=f"Discussion After {i}",
                 user_id=persisted_user.id,
+            )
+            # Create a step to trigger activity tracking
+            step_id = str(uuid.uuid4())
+            await data_layer.create_step(
+                {
+                    "id": step_id,
+                    "threadId": thread_id,
+                    "type": "user_message",
+                    "output": f"After Message {i}",
+                }
             )
             await asyncio.sleep(0.01)
 
@@ -361,6 +401,16 @@ class TestThreadOperations:
             name="PROJECT Beta",
             user_id=persisted_user.id,
         )
+        # Create a step to trigger activity tracking
+        step_id = str(uuid.uuid4())
+        await data_layer.create_step(
+            {
+                "id": step_id,
+                "threadId": thread_id,
+                "type": "user_message",
+                "output": "PROJECT Beta Message",
+            }
+        )
         await asyncio.sleep(0.01)
 
         # Create 21 threads that DON'T match (between the two pages)
@@ -371,6 +421,16 @@ class TestThreadOperations:
                 thread_id=thread_id,
                 name=f"Discussion Between {i}",
                 user_id=persisted_user.id,
+            )
+            # Create a step to trigger activity tracking
+            step_id = str(uuid.uuid4())
+            await data_layer.create_step(
+                {
+                    "id": step_id,
+                    "threadId": thread_id,
+                    "type": "user_message",
+                    "output": f"Between Message {i}",
+                }
             )
             await asyncio.sleep(0.01)
 
@@ -384,6 +444,16 @@ class TestThreadOperations:
                 name=f"PROJECT Alpha {i}",
                 user_id=persisted_user.id,
             )
+            # Create a step to trigger activity tracking
+            step_id = str(uuid.uuid4())
+            await data_layer.create_step(
+                {
+                    "id": step_id,
+                    "threadId": thread_id,
+                    "type": "user_message",
+                    "output": f"PROJECT Alpha Message {i}",
+                }
+            )
             await asyncio.sleep(0.01)
 
         # Create 20 threads that DON'T match (newest)
@@ -394,6 +464,16 @@ class TestThreadOperations:
                 thread_id=thread_id,
                 name=f"Discussion Thread {i}",
                 user_id=persisted_user.id,
+            )
+            # Create a step to trigger activity tracking
+            step_id = str(uuid.uuid4())
+            await data_layer.create_step(
+                {
+                    "id": step_id,
+                    "threadId": thread_id,
+                    "type": "user_message",
+                    "output": f"Thread Message {i}",
+                }
             )
             await asyncio.sleep(0.01)
 

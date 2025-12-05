@@ -130,6 +130,7 @@ class CassandraDataLayer(BaseDataLayer):
         )
         self._table_steps_by_thread = self._qualified_table("steps_by_thread_id")
         self._table_elements_by_thread = self._qualified_table("elements_by_thread_id")
+        self._table_step_activity = self._qualified_table("step_activity_by_thread")
         self.storage_client = storage_client
         self._prepared_statements: dict[str, PreparedStatement] = {}
 
@@ -167,8 +168,8 @@ class CassandraDataLayer(BaseDataLayer):
         batch.add(statement, parameters)
 
     def _get_current_timestamp(self) -> str:
-        """Get current timestamp in ISO format (UTC)."""
-        return datetime.now(UTC).isoformat()
+        """Get current timestamp in ISO format (UTC) with millisecond precision."""
+        return self._utc_now_millis().isoformat()
 
     def _to_utc_datetime(self, dt: datetime) -> datetime:
         """Convert a naive datetime (assumed UTC) to timezone-aware UTC datetime.
@@ -180,33 +181,48 @@ class CassandraDataLayer(BaseDataLayer):
             return dt.replace(tzinfo=UTC)
         return dt
 
+    def _truncate_to_millis(self, dt: datetime) -> datetime:
+        """Truncate datetime to millisecond precision (Cassandra's precision).
+
+        This prevents bugs where microsecond precision datetimes don't match
+        the values returned from Cassandra queries.
+        """
+        return dt.replace(microsecond=(dt.microsecond // 1000) * 1000)
+
+    def _utc_now_millis(self) -> datetime:
+        """Return current UTC time truncated to millisecond precision."""
+        return self._truncate_to_millis(datetime.now(UTC))
+
     def _parse_iso_datetime(self, iso_str: str) -> datetime:
-        """Parse ISO formatted datetime string into timezone-aware UTC datetime."""
+        """Parse ISO formatted datetime string into timezone-aware UTC datetime.
+
+        Returns datetime truncated to millisecond precision to match Cassandra storage.
+        """
         normalized = iso_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(normalized)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
-        return dt.astimezone(UTC)
+        return self._truncate_to_millis(dt.astimezone(UTC))
 
     async def _update_thread_activity(
         self,
-        thread_id: str,
-        user_id: str | None,
+        thread_id: uuid.UUID,
+        user_id: uuid.UUID | None,
         activity_timestamp: datetime,
-        thread_name: str | None = None,
-        thread_created_at: datetime | None = None,
+        thread_name: str,
+        thread_created_at: datetime,
     ):
         """Update thread activity in threads_by_user_activity table.
 
         Uses delete+insert pattern to handle clustering key changes.
-        Accepts potential race conditions (duplicates handled at read time).
+        Queries for the previous step to find the old activity timestamp to delete.
 
         Args:
             thread_id: Thread UUID
             user_id: User UUID (required - threads without users are not tracked)
-            activity_timestamp: New activity timestamp
-            thread_name: Thread name (optional, will fetch if not provided)
-            thread_created_at: Thread creation time (optional, will fetch if not provided)
+            activity_timestamp: New activity timestamp (created_at of new step)
+            thread_name: Thread name
+            thread_created_at: Thread creation time
         """
         if not user_id:
             # Threads without users cannot be listed, so don't track activity
@@ -215,79 +231,47 @@ class CassandraDataLayer(BaseDataLayer):
             )
             return
 
-        thread_id_uuid = uuid.UUID(thread_id)
-        user_id_uuid = uuid.UUID(user_id)
+        # Query the 5 most recent activities (newest first due to DESC clustering)
+        # This is efficient because step_activity_by_thread is clustered by created_at DESC
+        prev_activity_query = f"""
+        SELECT created_at, step_id FROM {self._table_step_activity}
+        WHERE thread_id = %s AND created_at < %s
+        LIMIT 5
+        """
+        activity_rows = await self._aexecute_prepared(
+            prev_activity_query, (thread_id, activity_timestamp)
+        )
 
-        # Fetch thread details if not provided
-        if thread_name is None or thread_created_at is None:
-            thread_query = f"""
-                SELECT name, created_at, last_activity_at, deleted
-                FROM {self._table_threads}
-                WHERE id = %s
-            """
-            thread_rows = await self._aexecute_prepared(thread_query, (thread_id_uuid,))
-            thread_row = thread_rows[0] if thread_rows else None
-            if not thread_row:
-                logger.warning(
-                    f"Cannot update activity for non-existent thread {thread_id}"
-                )
-                return
+        # Find old activity timestamp
+        old_activity_at_list = [row.created_at for row in activity_rows]
 
-            # Skip updates for deleted threads
-            if thread_row.deleted:
-                logger.debug(f"Skipping activity update for deleted thread {thread_id}")
-                return
-
-            if thread_name is None:
-                thread_name = thread_row.name
-            if thread_created_at is None:
-                thread_created_at = thread_row.created_at
-            old_activity_at = thread_row.last_activity_at
-        else:
-            # If provided, still need to fetch old activity timestamp
-            old_activity_query = (
-                f"SELECT last_activity_at FROM {self._table_threads} WHERE id = %s"
-            )
-            old_activity_rows = await self._aexecute_prepared(
-                old_activity_query, (thread_id_uuid,)
-            )
-            old_activity_row = old_activity_rows[0] if old_activity_rows else None
-            old_activity_at = (
-                old_activity_row.last_activity_at if old_activity_row else None
-            )
-
-        # Use batch for atomicity (delete old + insert new + update threads)
+        # Delete old activity entries (if any)
         batch = BatchStatement(batch_type=BatchType.LOGGED)
-
-        # Delete old activity entry (if exists)
-        if old_activity_at:
+        for old_activity_at in old_activity_at_list:
             self._batch_add_prepared(
                 batch,
-                f"""DELETE FROM {self._table_threads_by_user_activity}
-                   WHERE user_id = %s AND last_activity_at = %s AND thread_id = %s""",
-                (user_id_uuid, old_activity_at, thread_id_uuid),
+                f"""
+                DELETE FROM {self._table_threads_by_user_activity}
+                WHERE user_id = %s AND last_activity_at = %s AND thread_id = %s
+                """,
+                (user_id, old_activity_at, thread_id),
             )
 
-        # Insert new activity entry
+        # Insert the new activity entry
         self._batch_add_prepared(
             batch,
-            f"""INSERT INTO {self._table_threads_by_user_activity}
-               (user_id, last_activity_at, thread_id, thread_name, thread_created_at)
-               VALUES (%s, %s, %s, %s, %s)""",
+            f"""
+            INSERT INTO {self._table_threads_by_user_activity}
+            (user_id, last_activity_at, thread_id, thread_name, thread_created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
             (
-                user_id_uuid,
+                user_id,
                 activity_timestamp,
-                thread_id_uuid,
+                thread_id,
                 thread_name,
                 thread_created_at,
             ),
-        )
-
-        # Update threads table with new last_activity_at
-        self._batch_add_prepared(
-            batch,
-            f"UPDATE {self._table_threads} SET last_activity_at = %s WHERE id = %s",
-            (activity_timestamp, thread_id_uuid),
         )
 
         await self.session.aexecute(batch)
@@ -328,7 +312,7 @@ class CassandraDataLayer(BaseDataLayer):
             created_at = self._parse_iso_datetime(existing_user.createdAt)
         else:
             user_id = uuid.uuid4()
-            created_at = datetime.now(UTC)
+            created_at = self._utc_now_millis()
 
         batch = BatchStatement(batch_type=BatchType.LOGGED)
         self._batch_add_prepared(
@@ -629,18 +613,15 @@ class CassandraDataLayer(BaseDataLayer):
         This matches the reference implementation behavior.
         """
         thread_id = step_dict["threadId"]
+        thread_id_uuid = uuid.UUID(thread_id)
 
         # Update thread timestamp
         await self.update_thread(thread_id)
 
-        # Update thread activity - get user_id from threads table
+        # Update thread activity - get user_id, name, created_at from threads table
         # Also check if thread is deleted
-        thread_query = (
-            f"SELECT user_id, deleted FROM {self._table_threads} WHERE id = %s"
-        )
-        thread_rows = await self._aexecute_prepared(
-            thread_query, (uuid.UUID(thread_id),)
-        )
+        thread_query = f"SELECT user_id, deleted, name, created_at FROM {self._table_threads} WHERE id = %s"
+        thread_rows = await self._aexecute_prepared(thread_query, (thread_id_uuid,))
         thread_row = thread_rows[0] if thread_rows else None
 
         # Reject adding steps to deleted threads
@@ -698,11 +679,11 @@ class CassandraDataLayer(BaseDataLayer):
                 db_params["created_at"] = (
                     self._parse_iso_datetime(created_at_raw)
                     if isinstance(created_at_raw, str)
-                    else created_at_raw
+                    else self._truncate_to_millis(created_at_raw)
                 )
             else:
                 # Default to current time for new steps
-                db_params["created_at"] = datetime.now(UTC)
+                db_params["created_at"] = self._utc_now_millis()
         # else: For updates, never include created_at (preserve existing value)
 
         # Other timestamp fields
@@ -711,7 +692,7 @@ class CassandraDataLayer(BaseDataLayer):
             db_params["start"] = (
                 self._parse_iso_datetime(start_raw)
                 if isinstance(start_raw, str)
-                else start_raw
+                else self._truncate_to_millis(start_raw)
             )
 
         if "end" in step_dict and step_dict["end"]:
@@ -719,7 +700,7 @@ class CassandraDataLayer(BaseDataLayer):
             db_params["end"] = (
                 self._parse_iso_datetime(end_raw)
                 if isinstance(end_raw, str)
-                else end_raw
+                else self._truncate_to_millis(end_raw)
             )
 
         # generation: always include if present, even if empty dict (clears existing value)
@@ -741,14 +722,43 @@ class CassandraDataLayer(BaseDataLayer):
             VALUES ({placeholders})
         """
 
-        await self._aexecute_prepared(query, tuple(db_params.values()))
+        # Only write to activity table on creates (not updates)
+        if not is_update and "created_at" in db_params:
+            batch = BatchStatement(batch_type=BatchType.LOGGED)
 
-        # Update thread activity if we have a created_at timestamp
-        if "created_at" in db_params and thread_row and thread_row.user_id:
+            # Write to main steps table
+            self._batch_add_prepared(batch, query, tuple(db_params.values()))
+
+            # Write to activity tracking table
+            activity_insert = f"""
+                INSERT INTO {self._table_step_activity}
+                (thread_id, created_at, step_id)
+                VALUES (%s, %s, %s)
+            """
+            self._batch_add_prepared(
+                batch,
+                activity_insert,
+                (db_params["thread_id"], db_params["created_at"], db_params["id"]),
+            )
+
+            await self.session.aexecute(batch)
+        else:
+            # For updates, only write to main table (don't modify activity)
+            await self._aexecute_prepared(query, tuple(db_params.values()))
+
+        # Update thread activity only for creates (not updates)
+        if (
+            not is_update
+            and "created_at" in db_params
+            and thread_row
+            and thread_row.user_id
+        ):
             await self._update_thread_activity(
-                thread_id=thread_id,
-                user_id=str(thread_row.user_id),
+                thread_id=thread_id_uuid,
+                user_id=thread_row.user_id,
                 activity_timestamp=db_params["created_at"],
+                thread_name=thread_row.name,
+                thread_created_at=thread_row.created_at,
             )
 
     @queue_until_user_message()
@@ -1012,7 +1022,7 @@ class CassandraDataLayer(BaseDataLayer):
         if existing_row and existing_row.deleted:
             raise ValueError(f"Cannot update deleted thread {thread_id}")
 
-        now_utc = datetime.now(UTC)
+        now_utc = self._utc_now_millis()
         existing_created_at = (
             self._to_utc_datetime(existing_row.created_at)
             if existing_row and existing_row.created_at
@@ -1101,26 +1111,6 @@ class CassandraDataLayer(BaseDataLayer):
                 final_tags,
             ),
         )
-
-        # Update activity tracking if thread has a user
-        if final_user_id:
-            existing_last_activity = (
-                self._to_utc_datetime(existing_row.last_activity_at)
-                if existing_row and existing_row.last_activity_at
-                else None
-            )
-            activity_timestamp = existing_last_activity or created_at
-            thread_created_at = (
-                created_at if not existing_created_at else existing_created_at
-            )
-
-            await self._update_thread_activity(
-                thread_id=thread_id,
-                user_id=str(final_user_id),
-                activity_timestamp=activity_timestamp,
-                thread_name=final_name,
-                thread_created_at=thread_created_at,
-            )
 
     async def delete_thread(self, thread_id: str):
         """Delete a thread using efficient partition-level deletion.
