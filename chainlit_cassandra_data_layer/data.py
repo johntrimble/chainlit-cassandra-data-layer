@@ -649,7 +649,7 @@ class CassandraDataLayer(BaseDataLayer):
 
         # Build db_params dict with only non-None values
         # Maps camelCase StepDict keys to snake_case database columns
-        db_params = {}
+        db_params: dict[str, Any] = {}
 
         # Required fields
         if "id" in step_dict and step_dict["id"] is not None:
