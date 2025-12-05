@@ -676,8 +676,8 @@ class CassandraDataLayer(BaseDataLayer):
         if "isError" in step_dict and step_dict["isError"] is not None:
             db_params["is_error"] = step_dict["isError"]
 
-        # metadata: skip empty dicts (matches SQLAlchemy behavior)
-        if "metadata" in step_dict and step_dict["metadata"]:
+        # metadata: always include if present, even if empty dict (clears existing value)
+        if "metadata" in step_dict:
             db_params["metadata"] = _pack_metadata(step_dict["metadata"])
 
         if "tags" in step_dict and step_dict["tags"] is not None:
@@ -722,8 +722,8 @@ class CassandraDataLayer(BaseDataLayer):
                 else end_raw
             )
 
-        # generation: skip empty values (matches SQLAlchemy behavior)
-        if "generation" in step_dict and step_dict["generation"]:
+        # generation: always include if present, even if empty dict (clears existing value)
+        if "generation" in step_dict:
             db_params["generation"] = _pack_metadata(step_dict["generation"])
 
         if "showInput" in step_dict and step_dict["showInput"] is not None:
