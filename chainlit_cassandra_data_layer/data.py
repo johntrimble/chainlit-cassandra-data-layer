@@ -616,20 +616,22 @@ class CassandraDataLayer(BaseDataLayer):
 
     # Step methods
 
-    @queue_until_user_message()
-    async def create_step(self, step_dict: StepDict):
-        """Create a step."""
+    async def _create_step(self, step_dict: StepDict, is_update: bool = False):
+        """Internal helper to create or update a step with partial update semantics.
+
+        Args:
+            step_dict: Step data to insert/update
+            is_update: If True, this is an update operation (never modifies createdAt).
+                      If False, this is a create operation (createdAt is required).
+
+        Only fields present in step_dict are written. Omitted fields preserve
+        their existing values in the database (partial update semantics).
+        This matches the reference implementation behavior.
+        """
         thread_id = step_dict["threadId"]
 
         # Update thread timestamp
         await self.update_thread(thread_id)
-
-        created_at_raw = step_dict.get("createdAt")
-        created_at = (
-            self._parse_iso_datetime(created_at_raw)
-            if isinstance(created_at_raw, str) and created_at_raw
-            else datetime.now(UTC)
-        )
 
         # Update thread activity - get user_id from threads table
         # Also check if thread is deleted
@@ -645,65 +647,127 @@ class CassandraDataLayer(BaseDataLayer):
         if thread_row and thread_row.deleted:
             raise ValueError(f"Cannot add step to deleted thread {thread_id}")
 
-        if thread_row and thread_row.user_id:
+        # Build db_params dict with only non-None values
+        # Maps camelCase StepDict keys to snake_case database columns
+        db_params: dict[str, Any] = {}
+
+        # Required fields
+        if "id" in step_dict and step_dict["id"] is not None:
+            db_params["id"] = uuid.UUID(step_dict["id"])
+        if "threadId" in step_dict and step_dict["threadId"] is not None:
+            db_params["thread_id"] = uuid.UUID(step_dict["threadId"])
+
+        # Optional fields - only include if present and non-None
+        if "parentId" in step_dict and step_dict["parentId"]:
+            db_params["parent_id"] = uuid.UUID(step_dict["parentId"])
+
+        if "name" in step_dict and step_dict["name"] is not None:
+            db_params["name"] = step_dict["name"]
+
+        if "type" in step_dict and step_dict["type"] is not None:
+            db_params["type"] = step_dict["type"]
+
+        if "streaming" in step_dict and step_dict["streaming"] is not None:
+            db_params["streaming"] = step_dict["streaming"]
+
+        if "waitForAnswer" in step_dict and step_dict["waitForAnswer"] is not None:
+            db_params["wait_for_answer"] = step_dict["waitForAnswer"]
+
+        if "isError" in step_dict and step_dict["isError"] is not None:
+            db_params["is_error"] = step_dict["isError"]
+
+        # metadata: always include if present, even if empty dict (clears existing value)
+        if "metadata" in step_dict:
+            db_params["metadata"] = _pack_metadata(step_dict["metadata"])
+
+        if "tags" in step_dict and step_dict["tags"] is not None:
+            db_params["tags"] = step_dict["tags"]
+
+        if "input" in step_dict and step_dict["input"] is not None:
+            db_params["input"] = step_dict["input"]
+
+        if "output" in step_dict and step_dict["output"] is not None:
+            db_params["output"] = step_dict["output"]
+
+        # Handle createdAt based on whether this is an update or create
+        if not is_update:
+            # For create: createdAt is always included (required)
+            # Default to current time if not provided
+            if "createdAt" in step_dict and step_dict["createdAt"]:
+                created_at_raw = step_dict["createdAt"]
+                db_params["created_at"] = (
+                    self._parse_iso_datetime(created_at_raw)
+                    if isinstance(created_at_raw, str)
+                    else created_at_raw
+                )
+            else:
+                # Default to current time for new steps
+                db_params["created_at"] = datetime.now(UTC)
+        # else: For updates, never include created_at (preserve existing value)
+
+        # Other timestamp fields
+        if "start" in step_dict and step_dict["start"]:
+            start_raw = step_dict["start"]
+            db_params["start"] = (
+                self._parse_iso_datetime(start_raw)
+                if isinstance(start_raw, str)
+                else start_raw
+            )
+
+        if "end" in step_dict and step_dict["end"]:
+            end_raw = step_dict["end"]
+            db_params["end"] = (
+                self._parse_iso_datetime(end_raw)
+                if isinstance(end_raw, str)
+                else end_raw
+            )
+
+        # generation: always include if present, even if empty dict (clears existing value)
+        if "generation" in step_dict:
+            db_params["generation"] = _pack_metadata(step_dict["generation"])
+
+        if "showInput" in step_dict and step_dict["showInput"] is not None:
+            db_params["show_input"] = step_dict["showInput"]
+
+        if "language" in step_dict and step_dict["language"] is not None:
+            db_params["language"] = step_dict["language"]
+
+        # Build dynamic query with only the columns we have values for
+        columns = ", ".join(f'"{c}"' if c == "end" else c for c in db_params.keys())
+        placeholders = ", ".join(["%s"] * len(db_params))
+
+        query = f"""
+            INSERT INTO {self._table_steps_by_thread} ({columns})
+            VALUES ({placeholders})
+        """
+
+        await self._aexecute_prepared(query, tuple(db_params.values()))
+
+        # Update thread activity if we have a created_at timestamp
+        if "created_at" in db_params and thread_row and thread_row.user_id:
             await self._update_thread_activity(
                 thread_id=thread_id,
                 user_id=str(thread_row.user_id),
-                activity_timestamp=created_at,
+                activity_timestamp=db_params["created_at"],
             )
-        start_raw = step_dict.get("start")
-        start_time = (
-            self._parse_iso_datetime(start_raw)
-            if isinstance(start_raw, str) and start_raw
-            else None
-        )
-        end_raw = step_dict.get("end")
-        end_time = (
-            self._parse_iso_datetime(end_raw)
-            if isinstance(end_raw, str) and end_raw
-            else None
-        )
 
-        query = f"""
-            INSERT INTO {self._table_steps_by_thread} (
-                id, thread_id, parent_id, name, type, streaming,
-                wait_for_answer, is_error, metadata, tags, input, output,
-                created_at, start, "end", generation, show_input, language
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    @queue_until_user_message()
+    async def create_step(self, step_dict: StepDict):
+        """Create a new step.
+
+        The createdAt field is required (defaults to current time if not provided).
+        This creates a new activity entry for thread ordering.
         """
-
-        await self._aexecute_prepared(
-            query,
-            (
-                uuid.UUID(step_dict["id"]),  # Convert to UUID
-                uuid.UUID(step_dict["threadId"]),  # Convert to UUID
-                uuid.UUID(step_dict.get("parentId"))
-                if step_dict.get("parentId")
-                else None,  # Convert to UUID
-                step_dict.get("name"),
-                step_dict.get("type"),
-                step_dict.get("streaming", False),
-                step_dict.get("waitForAnswer"),
-                step_dict.get("isError", False),
-                _pack_metadata(step_dict.get("metadata", {})),
-                step_dict.get("tags"),
-                step_dict.get("input"),
-                step_dict.get("output"),
-                created_at,
-                start_time,
-                end_time,
-                _pack_metadata(step_dict.get("generation"))
-                if step_dict.get("generation")
-                else None,
-                step_dict.get("showInput"),
-                step_dict.get("language"),
-            ),
-        )
+        await self._create_step(step_dict, is_update=False)
 
     @queue_until_user_message()
     async def update_step(self, step_dict: StepDict):
-        """Update a step without overwriting existing feedback."""
-        await self.create_step(step_dict)
+        """Update an existing step.
+
+        The createdAt field is never modified (preserved from original creation).
+        This prevents creating duplicate activity entries.
+        """
+        await self._create_step(step_dict, is_update=True)
 
     @queue_until_user_message()
     async def delete_step(self, step_id: str):

@@ -2,7 +2,7 @@
 
 import asyncio
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 from chainlit.types import Feedback, PageInfo, Pagination, ThreadFilter
@@ -711,6 +711,85 @@ class TestStepOperations:
         assert step["feedback"] is not None, "Feedback should persist after update_step"
         assert step["feedback"]["value"] == 1
         assert step["feedback"]["comment"] == "Great response!"
+
+        # Clean up
+        await data_layer.delete_thread(test_thread_id)
+
+    async def test_update_step_preserves_omitted_fields(
+        self, data_layer, test_user_id, test_thread_id
+    ):
+        """Test that update_step preserves fields not in the update dict.
+
+        This verifies partial update semantics: omitted fields should preserve
+        their existing values, especially createdAt which prevents duplicate
+        activity entries.
+        """
+        # Create user and thread
+        user = User(identifier=test_user_id, metadata={})
+        persisted_user = await data_layer.create_user(user)
+        await data_layer.update_thread(
+            thread_id=test_thread_id,
+            name="Test Thread",
+            user_id=persisted_user.id,
+        )
+
+        # Create step with all fields
+        step_id = str(uuid.uuid4())
+        original_timestamp = datetime.now(UTC).isoformat()
+        full_step = {
+            "id": step_id,
+            "threadId": test_thread_id,
+            "name": "Original Name",
+            "type": "user_message",
+            "output": "Original Output",
+            "input": "Original Input",
+            "createdAt": original_timestamp,
+            "streaming": True,
+            "isError": False,
+        }
+        await data_layer.create_step(full_step)
+
+        # Verify initial state
+        thread = await data_layer.get_thread(test_thread_id)
+        assert len(thread["steps"]) == 1
+        initial_step = thread["steps"][0]
+        assert initial_step["name"] == "Original Name"
+        assert initial_step["output"] == "Original Output"
+        assert initial_step["input"] == "Original Input"
+        assert initial_step["type"] == "user_message"
+        assert initial_step["streaming"] is True
+
+        # Update only output field - partial update
+        partial_update = {
+            "id": step_id,
+            "threadId": test_thread_id,
+            "output": "Updated Output",
+        }
+        await data_layer.update_step(partial_update)
+
+        # Verify other fields were preserved
+        thread = await data_layer.get_thread(test_thread_id)
+        assert len(thread["steps"]) == 1
+        fetched = thread["steps"][0]
+
+        # Updated field
+        assert fetched["output"] == "Updated Output"
+
+        # Preserved fields (CRITICAL - these should not change!)
+        assert fetched["name"] == "Original Name", "name should be preserved"
+        assert fetched["input"] == "Original Input", "input should be preserved"
+        assert fetched["type"] == "user_message", "type should be preserved"
+        assert fetched["streaming"] is True, "streaming should be preserved"
+        assert fetched["isError"] is False, "isError should be preserved"
+
+        # MOST CRITICAL: createdAt should be preserved (prevents duplicate activity entries)
+        # Note: Cassandra has millisecond precision, so compare timestamps allowing for rounding
+        fetched_time = datetime.fromisoformat(fetched["createdAt"])
+        original_time = datetime.fromisoformat(original_timestamp)
+        time_diff = abs((fetched_time - original_time).total_seconds())
+        assert time_diff < 0.001, (
+            f"createdAt MUST be preserved (diff: {time_diff}s) to prevent duplicate activity entries"
+        )
 
         # Clean up
         await data_layer.delete_thread(test_thread_id)
