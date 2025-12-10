@@ -11,7 +11,7 @@ statements = [
   CREATE TABLE IF NOT EXISTS ${keyspace}.users (
     id UUID PRIMARY KEY,
     identifier TEXT,
-    created_at TIMESTAMP,
+    created_at UUID,
     metadata BLOB
   );
   """,
@@ -19,7 +19,7 @@ statements = [
   CREATE TABLE IF NOT EXISTS ${keyspace}.users_by_identifier (
     identifier TEXT PRIMARY KEY,
     id UUID,
-    created_at TIMESTAMP,
+    created_at UUID,
     metadata BLOB
   );
   """,
@@ -29,22 +29,18 @@ statements = [
     user_id UUID,
     user_identifier TEXT,
     name TEXT,
-    created_at TIMESTAMP,
-    last_activity_at TIMESTAMP,
+    created_at UUID,
     metadata BLOB,
     tags LIST<TEXT>,
     deleted BOOLEAN
   );
   """,
   """
-  CREATE TABLE IF NOT EXISTS ${keyspace}.threads_by_user_activity (
-    user_id UUID,
-    last_activity_at TIMESTAMP,
+  CREATE TABLE IF NOT EXISTS ${keyspace}.steps (
+    id UUID PRIMARY KEY,
     thread_id UUID,
-    thread_name TEXT,
-    thread_created_at TIMESTAMP,
-    PRIMARY KEY (user_id, last_activity_at, thread_id)
-  ) WITH CLUSTERING ORDER BY (last_activity_at DESC, thread_id ASC);
+    created_at UUID
+  )
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.steps_by_thread_id (
@@ -60,7 +56,7 @@ statements = [
     tags LIST<TEXT>,
     input TEXT,
     output TEXT,
-    created_at TIMESTAMP,
+    created_at UUID,
     start TIMESTAMP,
     end TIMESTAMP,
     generation BLOB,
@@ -91,11 +87,23 @@ statements = [
   );
   """,
   """
-  CREATE TABLE IF NOT EXISTS ${keyspace}.step_activity_by_thread (
+  CREATE TABLE IF NOT EXISTS ${keyspace}.threads_by_user_activity (
+    user_id UUID,
+    activity_at UUID,
     thread_id UUID,
-    created_at TIMESTAMP,
-    step_id UUID,
-    PRIMARY KEY (thread_id, created_at, step_id)
-  ) WITH CLUSTERING ORDER BY (created_at DESC, step_id ASC);
+    thread_name TEXT,
+    thread_created_at UUID,
+    PRIMARY KEY (user_id, activity_at, thread_id)
+  ) WITH CLUSTERING ORDER BY (activity_at DESC, thread_id ASC);
+  """,
+  """
+  CREATE TABLE IF NOT EXISTS ${keyspace}.user_activity_by_thread (
+    thread_id UUID,
+    user_id UUID STATIC,
+    activity_at UUID,
+    thread_name TEXT STATIC,
+    thread_created_at UUID STATIC,
+    PRIMARY KEY (thread_id, activity_at)
+  ) WITH CLUSTERING ORDER BY (thread_id, activity_at DESC);
   """
 ]

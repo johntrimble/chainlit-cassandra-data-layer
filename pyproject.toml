@@ -10,6 +10,7 @@ dependencies = [
     "cassandra-asyncio-driver",
     "uuid-utils",
     "msgpack>=1.0.0",
+    "uuid6"
 ]
 
 [project.urls]
@@ -34,6 +35,7 @@ dev = [
     "ruff>=0.8.6",
     "cqlsh",
     "mypy>=1.18.2",
+    "ipython",
 ]
 
 [tool.tox.env_run_base]
