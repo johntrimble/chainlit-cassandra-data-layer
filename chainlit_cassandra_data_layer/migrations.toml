@@ -32,14 +32,15 @@ statements = [
     created_at UUID,
     metadata BLOB,
     tags LIST<TEXT>,
-    deleted BOOLEAN
+    deleted_at UUID
   );
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.steps (
     id UUID PRIMARY KEY,
     thread_id UUID,
-    created_at UUID
+    created_at UUID,
+    deleted_at UUID
   )
   """,
   """
@@ -57,6 +58,7 @@ statements = [
     input TEXT,
     output TEXT,
     created_at UUID,
+    deleted_at UUID,
     start TIMESTAMP,
     end TIMESTAMP,
     generation BLOB,
@@ -99,11 +101,11 @@ statements = [
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.user_activity_by_thread (
     thread_id UUID,
-    user_id UUID STATIC,
     activity_at UUID,
+    user_id UUID STATIC,
     thread_name TEXT STATIC,
     thread_created_at UUID STATIC,
     PRIMARY KEY (thread_id, activity_at)
-  ) WITH CLUSTERING ORDER BY (thread_id, activity_at DESC);
+  ) WITH CLUSTERING ORDER BY (activity_at DESC);
   """
 ]
