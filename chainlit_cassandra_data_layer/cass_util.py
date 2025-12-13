@@ -92,8 +92,6 @@ class AsyncResultSetWrapper(Generic[RowT]):
         self._current_page_iter: Any = None
         self._page_index = 0
 
-        print("Current ResultSet type (at init):", type(self._current_result_set))
-
     def __aiter__(self) -> "AsyncResultSetWrapper[RowT]":
         """Initialize async iteration by creating iterator over current page.
 
@@ -105,10 +103,10 @@ class AsyncResultSetWrapper(Generic[RowT]):
         return self
 
     async def __anext__(self) -> RowT:
-        """Fetch the next row, fetching new pages via aexecute() as needed.
+        """Fetch the next row, fetching new pages via execute_async as needed.
 
         Iterates over the current page's rows (synchronous, non-blocking). When
-        the page is exhausted, calls session.aexecute() with paging_state to
+        the page is exhausted, calls session.execute_async() with paging_state to
         fetch the next page asynchronously (no blocking).
 
         Returns:
@@ -130,12 +128,36 @@ class AsyncResultSetWrapper(Generic[RowT]):
             # but remove paging_state if present - we manage it internally
             paging_state = self._current_result_set.paging_state
             fetch_kwargs = {k: v for k, v in self._execute_kwargs.items() if k != 'paging_state'}
-            self._current_result_set = await self._session.aexecute(
+
+            # Use same logic as aexecute() to get ResultSet from execute_async
+            from cassandra.cluster import ResultSet
+            import asyncio
+
+            future = self._session.execute_async(
                 self._query,
                 self._params,
                 paging_state=paging_state,
                 **fetch_kwargs
             )
+
+            loop = asyncio.get_running_loop()
+            async_future = loop.create_future()
+
+            def handle_result(result):
+                """Callback that wraps result in ResultSet."""
+                if not async_future.cancelled():
+                    result_set = ResultSet(future, result)
+                    loop.call_soon_threadsafe(lambda: async_future.set_result(result_set))
+
+            def handle_error(exc):
+                """Errback that sets exception."""
+                if not async_future.cancelled():
+                    loop.call_soon_threadsafe(lambda: async_future.set_exception(exc))
+
+            future.add_callback(handle_result)
+            future.add_errback(handle_error)
+
+            self._current_result_set = await async_future
 
             # Update iterator for new page
             self._current_page_iter = iter(self._current_result_set.current_rows)
@@ -150,7 +172,6 @@ class AsyncResultSetWrapper(Generic[RowT]):
     
     def one(self) -> RowT:
         """Return a single row from the current page of results."""
-        print("ResultSet type:", type(self._current_result_set))
         return self._current_result_set.one()
 
     # Expose useful ResultSet properties for inspection and debugging
@@ -191,18 +212,18 @@ class SessionWithAsyncExecute(Protocol):
         ...
 
 
-async def aexecute(session: SessionWithAsyncExecute, query, params=None, **kwargs) -> AsyncResultSet[Any]:
+async def aexecute(session: Any, query, params=None, **kwargs) -> AsyncResultSet[Any]:
     """Execute a query and return an async iterator over results.
 
-    Convenience function that wraps session.aexecute() and automatically
-    returns an AsyncResultSetWrapper for async iteration with automatic
-    pagination support.
+    Bypasses session.aexecute() to properly create ResultSet objects from
+    ResponseFuture callbacks. This is necessary because cassandra-asyncio-driver's
+    aexecute() returns a raw list from row_factory, not a ResultSet object.
 
     Args:
-        session: Cassandra session with aexecute() method
+        session: Cassandra session with execute_async() method
         query: Query string or Statement
         params: Query parameters (optional)
-        **kwargs: Additional arguments passed to session.aexecute() and preserved
+        **kwargs: Additional arguments passed to session.execute_async() and preserved
                  for subsequent page fetches (e.g., execution_profile, timeout,
                  trace, custom_payload, host, execute_as)
 
@@ -213,6 +234,34 @@ async def aexecute(session: SessionWithAsyncExecute, query, params=None, **kwarg
         async for row in aexecute(session, "SELECT * FROM users"):
             print(row.name)
     """
-    result_set = await session.aexecute(query, params, **kwargs)
-    print("ResultSet type (after aexecute):", type(result_set))
+    from cassandra.cluster import ResultSet
+    import asyncio
+
+    # Get ResponseFuture from execute_async (not aexecute)
+    future = session.execute_async(query, params, **kwargs)
+
+    # Create asyncio Future for result
+    loop = asyncio.get_running_loop()
+    async_future = loop.create_future()
+
+    def handle_result(result):
+        """Callback that wraps result in ResultSet like .result() does."""
+        if not async_future.cancelled():
+            # Wrap the raw list in ResultSet just like ResponseFuture.result() does
+            result_set = ResultSet(future, result)
+            loop.call_soon_threadsafe(lambda: async_future.set_result(result_set))
+
+    def handle_error(exc):
+        """Errback that sets exception."""
+        if not async_future.cancelled():
+            loop.call_soon_threadsafe(lambda: async_future.set_exception(exc))
+
+    # Attach callbacks
+    future.add_callback(handle_result)
+    future.add_errback(handle_error)
+
+    # Wait for result
+    result_set = await async_future
+
+    # Wrap in AsyncResultSetWrapper for async iteration
     return AsyncResultSetWrapper(session, query, params, result_set, **kwargs)

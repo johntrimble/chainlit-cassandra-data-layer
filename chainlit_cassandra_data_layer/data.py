@@ -104,7 +104,7 @@ class _ThreadActivity(TypedDict):
     user_id: uuid.UUID
     thread_id: uuid.UUID
     activity_at: uuid.UUID
-    created_at: Optional[datetime]
+    created_at: Optional[uuid.UUID]
     name: Optional[str]
 
 
@@ -112,15 +112,41 @@ def uuid7(*, time_ms:int|None=None, datetime:datetime|None=None) -> uuid.UUID:
     # Do not allow both time_ms and datetime to be provided
     if time_ms is not None and datetime is not None:
         raise ValueError("Provide only one of time_ms or datetime")
-    
+
+    if time_ms is None and datetime is not None:
+        time_ms = int(datetime.timestamp() * 1000)
+
     if time_ms is not None:
-        return uuid_utils.compat.uuid7(timestamp=time_ms)
+        # uuid_utils.uuid7 expects timestamp in seconds, not milliseconds
+        # Convert milliseconds to seconds and nanoseconds
+        timestamp_s = time_ms // 1000
+        nanos = (time_ms % 1000) * 1_000_000
+        return uuid_utils.compat.uuid7(timestamp=timestamp_s, nanos=nanos)
 
-    if datetime is not None:
-        epoch_millis = int(datetime.timestamp() * 1000)
-        return uuid_utils.compat.uuid7(timestamp=epoch_millis)
-
+    # No timestamp provided, use uuid_utils default
     return uuid_utils.compat.uuid7()
+
+
+def smallest_uuid7_for_datetime(dt: datetime) -> uuid.UUID:
+    """Get the smallest UUIDv7 for the given datetime."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    else:
+        dt = dt.astimezone(UTC)
+    epoch_millis = int(dt.timestamp() * 1000)
+
+    # Construct the smallest UUID7 for this timestamp
+    # First 48 bits: timestamp in milliseconds
+    timestamp_ms = epoch_millis & 0xFFFFFFFFFFFF
+    uuid_int = timestamp_ms << 80
+
+    # Next 16 bits: version 7 (0x7000) with all other bits as 0
+    uuid_int |= 0x7000 << 64
+
+    # Next 64 bits: variant (0b10) in high 2 bits, all other bits as 0
+    uuid_int |= 0b10 << 62
+
+    return uuid.UUID(int=uuid_int)
 
 
 def to_uuid_utils_uuid(u: str | uuid.UUID | uuid_utils.UUID) -> uuid_utils.UUID:
@@ -153,6 +179,12 @@ def uuid7_millis(u: uuid.UUID | uuid_utils.UUID | str) -> int:
         raise ValueError("UUID is not version 7")
     return u.timestamp
 
+def uuid7_to_datetime(u: uuid.UUID | uuid_utils.UUID | str) -> datetime:
+    """Convert a UUIDv7 to a timezone-aware UTC datetime."""
+    millis = uuid7_millis(u)
+    time_epoch_seconds = millis / 1000
+    dt = datetime.fromtimestamp(time_epoch_seconds, tz=UTC)
+    return dt
 
 def uuid7_isoformat(u: uuid.UUID) -> str:
     """Convert a UUIDv7 to an ISO formatted datetime string (UTC)."""
@@ -160,7 +192,6 @@ def uuid7_isoformat(u: uuid.UUID) -> str:
     time_epoch_seconds = millis / 1000
     dt = datetime.fromtimestamp(time_epoch_seconds, tz=UTC)
     return dt.isoformat()
-
 
 def isoformat_to_uuid7(iso_str: str) -> uuid.UUID:
     """Convert an ISO formatted datetime string (UTC) to a UUIDv7."""
@@ -310,19 +341,20 @@ class CassandraDataLayer(BaseDataLayer):
         """
 
         query = f"""
-        SELECT activity_at FROM {self._table_threads_by_user_activity}
-        WHERE user_id = %s AND thread_id = %s
+        SELECT thread_name, thread_created_at, activity_at FROM {self._table_user_activity_by_thread}
+        WHERE thread_id = %s
         LIMIT {limit}
         """
-        rows = await self._aexecute_prepared(query, (user_id, thread_id))
+        rows = await self._aexecute_prepared(query, (thread_id,))
         return [
             _ThreadActivity(
                 user_id=user_id,
                 thread_id=thread_id,
                 activity_at=row.activity_at,
-                name='', # TODO: populate name
+                created_at=row.thread_created_at,
+                name=row.thread_name,
             )
-            for row in rows
+            for row in rows.current_rows
         ]
 
     async def _update_activity_by_thread(
@@ -394,6 +426,7 @@ class CassandraDataLayer(BaseDataLayer):
         insert_query = f"""
         INSERT INTO {self._table_threads_by_user_activity}
         (user_id, activity_at, thread_id, thread_name, thread_created_at)
+        VALUES (%s, %s, %s, %s, %s)
         """
         self._batch_add_prepared(
             batch,
@@ -409,9 +442,9 @@ class CassandraDataLayer(BaseDataLayer):
 
         # Step 4: Execute batch for 2 and 3
         #
-        # Bundling all of this into a single logged batch reduces the chance of
-        # seeing duplicate entries in threads_by_user_activity in case of
-        await self._aexecute_prepared(batch)
+        # Bundling all of this into a single batch reduces the chance of
+        # seeing duplicate entries in threads_by_user_activity.
+        await aexecute(self.session, batch)
 
         # Step 5: Delete old activities from user_activity_by_thread
         #
@@ -420,7 +453,7 @@ class CassandraDataLayer(BaseDataLayer):
         # worse if we do it that way.
         delete_by_thread_query = f"""
         DELETE FROM {self._table_user_activity_by_thread}
-        WHERE user_id = %s AND thread_id = %s AND activity_at = %s
+        WHERE thread_id = %s AND activity_at = %s
         """
         tasks = []
         for activity in activities:
@@ -428,7 +461,6 @@ class CassandraDataLayer(BaseDataLayer):
                 self._aexecute_prepared(
                     delete_by_thread_query,
                     (
-                        activity['user_id'],
                         activity['thread_id'],
                         activity['activity_at'],
                     )
@@ -494,9 +526,14 @@ class CassandraDataLayer(BaseDataLayer):
         if not row or row.created_at is None:
             return None
 
+        return row
+
     async def get_user(self, identifier: str) -> PersistedUser | None:
         """Get a user by identifier."""
         row = await self._get_user_row(identifier)
+
+        if row is None:
+            return None
 
         metadata = _unpack_metadata(row.metadata)
         return PersistedUser(
@@ -554,7 +591,7 @@ class CassandraDataLayer(BaseDataLayer):
             param_values,
         )
 
-        await self.session.aexecute(batch)
+        await aexecute(self.session, batch)
         return await self.get_user(user.identifier)
 
     # Feedback methods
@@ -927,7 +964,7 @@ class CassandraDataLayer(BaseDataLayer):
             # Chainlit gives us createdAt, but uuidv7 is more convenient for
             # ordering and lookups later, so we generate our own.
             created_at_uuid = uuid7()
-            db_params["created_at_uuid"] = created_at_uuid
+            db_params["created_at"] = created_at_uuid
             
             if step_dict.get("createdAt"):
                 # Use provided createdAt
@@ -973,7 +1010,7 @@ class CassandraDataLayer(BaseDataLayer):
             # Populate the steps table as well for creates. This is so we can
             # map back to the thread from the step ID later if needed.
             steps_table_query = f"""
-            INSERT INTO {self._table_all_steps} (id, thread_id, created_at)
+            INSERT INTO {self._table_steps} (id, thread_id, created_at)
             VALUES (%s, %s, %s)
             """
             queries_and_params.append(
@@ -1064,7 +1101,7 @@ class CassandraDataLayer(BaseDataLayer):
                 deleted_at = uuid7()
 
                 soft_delete_steps_table_query = f"""
-                UPDATE {self._table_all_steps}
+                UPDATE {self._table_steps}
                 SET deleted_at = %s
                 WHERE id = %s
                 """
@@ -1080,12 +1117,12 @@ class CassandraDataLayer(BaseDataLayer):
                 self._batch_add_prepared(
                     batch,
                     soft_delete_steps_table_query,
-                    (deleted_at, uuid.UUID(step_id)),
+                    (deleted_at, to_uuid(step_id)),
                 )
                 self._batch_add_prepared(
                     batch,
                     soft_delete_steps_by_thread_query,
-                    (deleted_at, thread_id, uuid.UUID(step_id)),
+                    (deleted_at, thread_id, to_uuid(step_id)),
                 )
                 await self.session.aexecute(batch)
 
@@ -1106,7 +1143,7 @@ class CassandraDataLayer(BaseDataLayer):
                 # Delete all elements in parallel using existing delete_element
                 # This properly cleans up storage AND deletes from both tables
                 delete_elements_tasks = []
-                element_ids_to_delete = [row.id for row in elements_rs if row.for_id == step_id]
+                element_ids_to_delete = [row.id async for row in elements_rs if row.for_id == step_id]
                 for element_id in element_ids_to_delete:
                     delete_elements_tasks.append(
                         self.delete_element(str(element_id), thread_id)
@@ -1187,7 +1224,7 @@ class CassandraDataLayer(BaseDataLayer):
 
         steps = []
         step_ids = []
-        for row in step_rows:
+        async for row in step_rows:
             step_ids.append(row.id)
 
             # Build feedback dict from inline columns, generating feedback_id from step_id
@@ -1242,7 +1279,7 @@ class CassandraDataLayer(BaseDataLayer):
         )
 
         elements = []
-        for row in element_rows:
+        async for row in element_rows:
             # Generate signed URL if storage_client is configured and no direct URL exists
             url = row.url
             if self.storage_client is not None and not url and row.object_key:
@@ -1505,7 +1542,7 @@ class CassandraDataLayer(BaseDataLayer):
         )
         activity_at_and_user_ids = [
             (row.activity_at, row.user_id) 
-            for row in rs
+            async for row in rs
             if row.activity_at and row.user_id
         ]
         delete_activity_tasks = []
@@ -1578,7 +1615,7 @@ class CassandraDataLayer(BaseDataLayer):
                 select_step_ids_query,
                 (thread_id,),
             )
-            step_ids = [row.id for row in rs]
+            step_ids = [row.id async for row in rs]
             delete_step_tasks = []
             for step_id in step_ids:
                 delete_step_tasks.append(
@@ -1655,7 +1692,7 @@ class CassandraDataLayer(BaseDataLayer):
         # To correctly determine hasNextPage, we fetch one extra batch after getting
         # enough results to check if more matches exist
         matching_rows: list[Any] = []
-        current_cursor_timestamp: datetime | None = None
+        current_cursor_timestamp: uuid.UUID | None = None
         current_cursor_thread_id: uuid.UUID | None = None
         all_seen_threads: dict[str, Any] = {}
         all_duplicates_to_delete: list[Any] = []
@@ -1668,12 +1705,8 @@ class CassandraDataLayer(BaseDataLayer):
         if pagination.cursor:
             try:
                 cursor_parts = pagination.cursor.split(",", 1)
-                current_cursor_timestamp = datetime.fromisoformat(cursor_parts[0])
-                if current_cursor_timestamp.tzinfo is not None:
-                    current_cursor_timestamp = current_cursor_timestamp.replace(
-                        tzinfo=None
-                    )
-                current_cursor_thread_id = uuid.UUID(cursor_parts[1])
+                current_cursor_timestamp = to_uuid(cursor_parts[0])
+                current_cursor_thread_id = to_uuid(cursor_parts[1])
             except (ValueError, IndexError) as e:
                 self.log.warning(
                     f"Invalid cursor format: {pagination.cursor}, error: {e}"
@@ -1694,13 +1727,13 @@ class CassandraDataLayer(BaseDataLayer):
             # Build query based on whether we have a cursor
             if current_cursor_timestamp and current_cursor_thread_id:
                 query = f"""
-                    SELECT thread_id, thread_name, thread_created_at, last_activity_at
+                    SELECT thread_id, thread_name, thread_created_at, activity_at
                     FROM {self._table_threads_by_user_activity}
                     WHERE user_id = %s
-                    AND (last_activity_at, thread_id) < (%s, %s)
+                    AND (activity_at, thread_id) < (%s, %s)
                     LIMIT %s
                 """
-                rows = await self._aexecute_prepared(
+                rs = await self._aexecute_prepared(
                     query,
                     (
                         user_id,
@@ -1711,15 +1744,15 @@ class CassandraDataLayer(BaseDataLayer):
                 )
             else:
                 query = f"""
-                    SELECT thread_id, thread_name, thread_created_at, last_activity_at
+                    SELECT thread_id, thread_name, thread_created_at, activity_at
                     FROM {self._table_threads_by_user_activity}
                     WHERE user_id = %s
                     LIMIT %s
                 """
-                rows = await self._aexecute_prepared(query, (user_id, fetch_limit + 3))
+                rs = await self._aexecute_prepared(query, (user_id, fetch_limit + 3))
 
             # If we got no rows, we've reached the end
-            if not rows:
+            if not rs.current_rows:
                 reached_end = True
                 break
 
@@ -1727,7 +1760,7 @@ class CassandraDataLayer(BaseDataLayer):
             seen_threads = {}
             duplicates_to_delete = []
 
-            for row in rows:
+            for row in rs.current_rows:
                 thread_id_str = str(row.thread_id)
 
                 # Check against all previously seen threads across all fetches
@@ -1768,13 +1801,13 @@ class CassandraDataLayer(BaseDataLayer):
                 found_extra_match = True
 
             # Update cursor to last row for next iteration
-            if rows:
-                last_row = rows[-1]
-                current_cursor_timestamp = last_row.last_activity_at
+            if rs.current_rows:
+                last_row = rs.current_rows[-1]
+                current_cursor_timestamp = last_row.activity_at
                 current_cursor_thread_id = last_row.thread_id
 
             # If we got fewer rows than requested, we've reached the end
-            if len(rows) < fetch_limit:
+            if len(rs.current_rows) < fetch_limit:
                 reached_end = True
                 # Mark that we've checked for extra matches (even if we didn't find any)
                 if len(matching_rows) >= limit:
@@ -1827,7 +1860,7 @@ class CassandraDataLayer(BaseDataLayer):
         if paginated_rows:
             # For start cursor, use the first row we're returning
             first_row = paginated_rows[0]
-            start_cursor = f"{self._to_utc_datetime(first_row.last_activity_at).isoformat()},{first_row.thread_id}"
+            start_cursor = f"{str(first_row.activity_at)},{first_row.thread_id}"
 
             # For end cursor, we want to position right before the first match on the next page
             # This ensures the next page doesn't rescan rows we've already processed
@@ -1842,15 +1875,14 @@ class CassandraDataLayer(BaseDataLayer):
                 # So cursor with timestamp + 1ms will position us right before this match
                 from datetime import timedelta
 
-                cursor_timestamp = next_page_first_match.last_activity_at + timedelta(
+                cursor_timestamp = uuid7_to_datetime(next_page_first_match.activity_at) + timedelta(
                     milliseconds=1
                 )
-                end_cursor = f"{self._to_utc_datetime(cursor_timestamp).isoformat()},{next_page_first_match.thread_id}"
+                end_cursor = f"{str(smallest_uuid7_for_datetime(cursor_timestamp))},{next_page_first_match.thread_id}"
             else:
                 # No next page - use the last row we're returning
                 last_row = paginated_rows[-1]
-                end_cursor = f"{self._to_utc_datetime(last_row.last_activity_at).isoformat()},{last_row.thread_id}"
-
+                end_cursor = f"{str(smallest_uuid7_for_datetime(uuid7_to_datetime(last_row.activity_at)))},{last_row.thread_id}"
         # Determine if there are more pages
         # hasNextPage is true only if we found more matching results than requested
         # This is determined by finding matches beyond the limit during our fetch loop

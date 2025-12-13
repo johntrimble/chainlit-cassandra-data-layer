@@ -21,37 +21,59 @@ class MockRow(NamedTuple):
     value: int
 
 
-class MockResultSet:
-    """Mock ResultSet that simulates cassandra-driver pagination behavior.
+class MockResponseFuture:
+    """Mock ResponseFuture that simulates cassandra-driver behavior.
 
-    This mock allows us to test pagination without a real Cassandra instance.
-    It tracks paging state and supports multiple pages.
+    This mock simulates the behavior of ResponseFuture from cassandra-driver,
+    which is what execute_async() returns. It supports callbacks and errbacks
+    that receive the raw result (list from row_factory).
     """
 
-    def __init__(self, pages: list[list[MockRow]], column_names: list[str] | None = None):
-        """Initialize with list of pages (each page is a list of rows).
+    def __init__(self, pages: list[list[MockRow]], page_index: int = 0):
+        """Initialize mock future with pages data.
 
         Args:
-            pages: List of pages, where each page is a list of rows
-            column_names: Optional column names (defaults to ['id', 'name', 'value'])
+            pages: All available pages of data
+            page_index: Current page index
         """
-        self._all_pages = pages
-        self._page_index = 0
-        self.column_names = column_names or ['id', 'name', 'value']
-        self.has_more_pages = len(pages) > 1
-        self.current_rows = pages[0] if pages else []
-        self.paging_state = f"page_{self._page_index}" if self.has_more_pages else None
-
-    def _advance_to_page(self, page_index: int):
-        """Simulate advancing to a specific page (used by mock session)."""
+        self._pages = pages
         self._page_index = page_index
-        self.current_rows = self._all_pages[page_index] if page_index < len(self._all_pages) else []
-        self.has_more_pages = page_index < len(self._all_pages) - 1
-        self.paging_state = f"page_{page_index}" if self.has_more_pages else None
+        self._callbacks = []
+        self._errbacks = []
+        # These attributes are needed for ResultSet construction
+        self._col_names = ['id', 'name', 'value']
+        self._col_types = None
+        self._paging_state = f"page_{page_index}" if page_index < len(pages) - 1 else None
+        self.has_more_pages = page_index < len(pages) - 1
+
+    def add_callback(self, fn, *args, **kwargs):
+        """Register callback to be called with result.
+
+        Callbacks receive the raw result (list of rows from row_factory),
+        not a ResultSet object. This matches real ResponseFuture behavior.
+        """
+        self._callbacks.append((fn, args, kwargs))
+        # Immediately trigger callback in async context
+        import asyncio
+        # Get current page rows (simulating row_factory output)
+        result = self._pages[self._page_index] if self._page_index < len(self._pages) else []
+        # Schedule callback
+        loop = asyncio.get_event_loop()
+        loop.call_soon(lambda: fn(result, *args, **kwargs))
+        return self
+
+    def add_errback(self, fn, *args, **kwargs):
+        """Register errback to be called with exception."""
+        self._errbacks.append((fn, args, kwargs))
+        return self
 
 
 class MockSession:
-    """Mock Cassandra session that simulates aexecute() with pagination."""
+    """Mock Cassandra session that simulates execute_async() with pagination.
+
+    This mock returns MockResponseFuture objects to simulate the real
+    cassandra-driver Session.execute_async() method.
+    """
 
     def __init__(self, pages: list[list[MockRow]]):
         """Initialize with pages of data.
@@ -60,11 +82,10 @@ class MockSession:
             pages: List of pages to return sequentially
         """
         self._pages = pages
-        self._result_set = MockResultSet(pages)
         self._call_count = 0
 
-    async def aexecute(self, query, params=None, paging_state=None, **kwargs):
-        """Mock aexecute that returns pages based on paging_state.
+    def execute_async(self, query, params=None, paging_state=None, **kwargs):
+        """Mock execute_async that returns ResponseFuture.
 
         Args:
             query: Query (ignored in mock)
@@ -73,7 +94,7 @@ class MockSession:
             **kwargs: Additional args (ignored)
 
         Returns:
-            MockResultSet configured for the appropriate page
+            MockResponseFuture configured for the appropriate page
         """
         self._call_count += 1
 
@@ -84,10 +105,8 @@ class MockSession:
             # Extract page index from paging_state
             page_index = int(paging_state.split('_')[1]) + 1
 
-        # Create result set for this page
-        result = MockResultSet(self._pages, self._result_set.column_names)
-        result._advance_to_page(page_index)
-        return result
+        # Return ResponseFuture for this page
+        return MockResponseFuture(self._pages, page_index)
 
 
 @pytest.mark.asyncio
@@ -102,9 +121,7 @@ class TestAsyncResultSetWrapper:
             MockRow(uuid.uuid4(), "Charlie", 300),
         ]
         mock_session = MockSession([rows])
-        initial_result = await mock_session.aexecute("SELECT * FROM test")
-
-        wrapper = AsyncResultSetWrapper(mock_session, "SELECT * FROM test", None, initial_result)
+        wrapper = await aexecute(mock_session, "SELECT * FROM test")
 
         result = []
         async for row in wrapper:
@@ -131,9 +148,7 @@ class TestAsyncResultSetWrapper:
         ]
 
         mock_session = MockSession([page1, page2, page3])
-        initial_result = await mock_session.aexecute("SELECT * FROM test")
-
-        wrapper = AsyncResultSetWrapper(mock_session, "SELECT * FROM test", None, initial_result)
+        wrapper = await aexecute(mock_session, "SELECT * FROM test")
 
         result = []
         async for row in wrapper:
@@ -153,9 +168,7 @@ class TestAsyncResultSetWrapper:
     async def test_empty_result_set(self):
         """Test async iteration over empty result set."""
         mock_session = MockSession([[]])
-        initial_result = await mock_session.aexecute("SELECT * FROM empty")
-
-        wrapper = AsyncResultSetWrapper(mock_session, "SELECT * FROM empty", None, initial_result)
+        wrapper = await aexecute(mock_session, "SELECT * FROM empty")
 
         result = []
         async for row in wrapper:
@@ -167,9 +180,7 @@ class TestAsyncResultSetWrapper:
         """Test that column_names property is exposed."""
         rows = [MockRow(uuid.uuid4(), "Test", 1)]
         mock_session = MockSession([rows])
-        initial_result = await mock_session.aexecute("SELECT * FROM test")
-
-        wrapper = AsyncResultSetWrapper(mock_session, "SELECT * FROM test", None, initial_result)
+        wrapper = await aexecute(mock_session, "SELECT * FROM test")
 
         assert wrapper.column_names == ['id', 'name', 'value']
 
@@ -179,9 +190,7 @@ class TestAsyncResultSetWrapper:
         page2 = [MockRow(uuid.uuid4(), "Row2", 2)]
 
         mock_session = MockSession([page1, page2])
-        initial_result = await mock_session.aexecute("SELECT * FROM test")
-
-        wrapper = AsyncResultSetWrapper(mock_session, "SELECT * FROM test", None, initial_result)
+        wrapper = await aexecute(mock_session, "SELECT * FROM test")
 
         # Before iteration starts
         assert wrapper.has_more_pages is True
@@ -201,9 +210,7 @@ class TestAsyncResultSetWrapper:
         page2 = [MockRow(uuid.uuid4(), "Row3", 3)]
 
         mock_session = MockSession([page1, page2])
-        initial_result = await mock_session.aexecute("SELECT * FROM test")
-
-        wrapper = AsyncResultSetWrapper(mock_session, "SELECT * FROM test", None, initial_result)
+        wrapper = await aexecute(mock_session, "SELECT * FROM test")
 
         # Before iteration
         assert len(wrapper.current_rows) == 2
@@ -226,11 +233,8 @@ class TestAsyncResultSetWrapper:
         mock_session1 = MockSession([rows1])
         mock_session2 = MockSession([rows2])
 
-        initial_result1 = await mock_session1.aexecute("SELECT * FROM test1")
-        initial_result2 = await mock_session2.aexecute("SELECT * FROM test2")
-
-        wrapper1 = AsyncResultSetWrapper(mock_session1, "SELECT * FROM test1", None, initial_result1)
-        wrapper2 = AsyncResultSetWrapper(mock_session2, "SELECT * FROM test2", None, initial_result2)
+        wrapper1 = await aexecute(mock_session1, "SELECT * FROM test1")
+        wrapper2 = await aexecute(mock_session2, "SELECT * FROM test2")
 
         async def collect_rows(wrapper):
             result = []
@@ -256,12 +260,10 @@ class TestAsyncResultSetWrapper:
         mock_session = MockSession([page1, page2])
         test_params = (uuid.uuid4(), "test_value")
 
-        initial_result = await mock_session.aexecute("SELECT * FROM test WHERE id = %s AND name = %s", test_params)
-        wrapper = AsyncResultSetWrapper(
+        wrapper = await aexecute(
             mock_session,
             "SELECT * FROM test WHERE id = %s AND name = %s",
-            test_params,
-            initial_result
+            test_params
         )
 
         result = []
@@ -277,7 +279,7 @@ class TestAsyncResultSetWrapper:
         page1 = [MockRow(uuid.uuid4(), "Page1", 1)]
         page2 = [MockRow(uuid.uuid4(), "Page2", 2)]
 
-        # Track what kwargs were passed to aexecute
+        # Track what kwargs were passed to execute_async
         captured_kwargs = []
 
         class MockSessionWithKwargs:
@@ -285,7 +287,7 @@ class TestAsyncResultSetWrapper:
                 self._pages = pages
                 self._call_count = 0
 
-            async def aexecute(self, query, params=None, **kwargs):
+            def execute_async(self, query, params=None, **kwargs):
                 captured_kwargs.append(kwargs.copy())
                 self._call_count += 1
 
@@ -295,26 +297,15 @@ class TestAsyncResultSetWrapper:
                 else:
                     page_index = int(kwargs['paging_state'].split('_')[1]) + 1
 
-                result = MockResultSet(self._pages)
-                result._advance_to_page(page_index)
-                return result
+                return MockResponseFuture(self._pages, page_index)
 
         mock_session = MockSessionWithKwargs([page1, page2])
 
-        # Call with specific kwargs
-        initial_result = await mock_session.aexecute(
-            "SELECT * FROM test",
-            None,
-            timeout=30,
-            trace=True,
-            execution_profile="custom_profile"
-        )
-
-        wrapper = AsyncResultSetWrapper(
+        # Call aexecute helper with specific kwargs
+        wrapper = await aexecute(
             mock_session,
             "SELECT * FROM test",
             None,
-            initial_result,
             timeout=30,
             trace=True,
             execution_profile="custom_profile"
@@ -356,7 +347,7 @@ class TestAsyncResultSetWrapper:
             def __init__(self, pages):
                 self._pages = pages
 
-            async def aexecute(self, query, params=None, **kwargs):
+            def execute_async(self, query, params=None, **kwargs):
                 # Track the paging_state that was actually used
                 captured_paging_states.append(kwargs.get('paging_state'))
 
@@ -371,25 +362,15 @@ class TestAsyncResultSetWrapper:
                     # Invalid/wrong paging state - just return first page
                     page_index = 0
 
-                result = MockResultSet(self._pages)
-                result._advance_to_page(page_index)
-                return result
+                return MockResponseFuture(self._pages, page_index)
 
         mock_session = MockSessionTrackingPagingState([page1, page2])
 
-        # Initial call with a paging_state in kwargs (this should be ignored for initial call)
-        initial_result = await mock_session.aexecute(
-            "SELECT * FROM test",
-            None,
-            paging_state="wrong_state"  # This shouldn't affect pagination
-        )
-
-        # Create wrapper - it should manage its own paging_state
-        wrapper = AsyncResultSetWrapper(
+        # Initial call with a paging_state in kwargs using aexecute helper
+        wrapper = await aexecute(
             mock_session,
             "SELECT * FROM test",
             None,
-            initial_result,
             paging_state="wrong_state"  # This should be overridden during pagination
         )
 
@@ -413,9 +394,7 @@ class TestAsyncResultSetWrapper:
         page2 = [MockRow(uuid.uuid4(), "Page2", 2)]
 
         mock_session = MockSession([page1, page2])
-        initial_result = await mock_session.aexecute("SELECT * FROM test")
-
-        wrapper = AsyncResultSetWrapper(mock_session, "SELECT * FROM test", None, initial_result)
+        wrapper = await aexecute(mock_session, "SELECT * FROM test")
 
         # Before iteration - should have paging state since there are more pages
         assert wrapper.paging_state == "page_0"
@@ -471,17 +450,11 @@ class TestAsyncResultSetWrapper:
         # ... (this would happen over network) ...
 
         # Step 4: Later, client requests next page with the paging_state
-        # We can create a new wrapper with the paging_state
-        second_page_result = await mock_session.aexecute(
-            "SELECT * FROM test",
-            None,
-            paging_state=first_paging_state
-        )
-        wrapper2 = AsyncResultSetWrapper(
+        wrapper2 = await aexecute(
             mock_session,
             "SELECT * FROM test",
             None,
-            second_page_result
+            paging_state=first_paging_state
         )
 
         # Extract second page data
@@ -495,16 +468,11 @@ class TestAsyncResultSetWrapper:
         assert wrapper2.has_more_pages is True
 
         # Step 5: Get third page
-        third_page_result = await mock_session.aexecute(
-            "SELECT * FROM test",
-            None,
-            paging_state=second_paging_state
-        )
-        wrapper3 = AsyncResultSetWrapper(
+        wrapper3 = await aexecute(
             mock_session,
             "SELECT * FROM test",
             None,
-            third_page_result
+            paging_state=second_paging_state
         )
 
         third_page_rows = wrapper3.current_rows
@@ -549,3 +517,155 @@ class TestAexecuteHelperFunction:
 
         assert len(result) == 1
         assert result[0].name == "Alice"
+
+
+@pytest.fixture
+def cassandra_integration_session():
+    """Create Cassandra session for integration tests."""
+    from cassandra.cluster import Cluster
+
+    cluster = Cluster(contact_points=["cassandra"])
+    session = cluster.connect()
+
+    # Drop and create test keyspace
+    session.execute("DROP KEYSPACE IF EXISTS cass_util_integration_test")
+    session.execute("""
+        CREATE KEYSPACE cass_util_integration_test
+        WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}
+    """)
+    session.set_keyspace("cass_util_integration_test")
+
+    # Create test table
+    session.execute("""
+        CREATE TABLE test_data (
+            id UUID PRIMARY KEY,
+            name TEXT,
+            value INT
+        )
+    """)
+
+    yield session
+
+    # Cleanup
+    session.execute("DROP KEYSPACE IF EXISTS cass_util_integration_test")
+    session.shutdown()
+    cluster.shutdown()
+
+
+@pytest.mark.asyncio
+class TestCassUtilIntegration:
+    """Integration tests against real Cassandra database."""
+
+    async def test_pagination_with_real_cassandra(self, cassandra_integration_session):
+        """Test pagination with real Cassandra cluster."""
+        session = cassandra_integration_session
+
+        # Insert 20 rows
+        for i in range(20):
+            test_id = uuid.uuid4()
+            session.execute(
+                "INSERT INTO test_data (id, name, value) VALUES (%s, %s, %s)",
+                (test_id, f"Row_{i}", i)
+            )
+
+        # Create a prepared statement with small fetch_size to force pagination
+        from cassandra.query import SimpleStatement
+        query = SimpleStatement("SELECT * FROM test_data", fetch_size=5)
+
+        # Use aexecute with the query
+        wrapper = await aexecute(session, query)
+
+        # Verify we can iterate and get all rows
+        result = []
+        async for row in wrapper:
+            result.append(row)
+
+        assert len(result) == 20
+        # Verify session was called multiple times for pagination
+        # (20 rows / 5 fetch_size = 4 pages)
+
+    async def test_resultset_properties_with_real_data(self, cassandra_integration_session):
+        """Test ResultSet properties with real Cassandra data."""
+        session = cassandra_integration_session
+
+        # Insert 10 rows
+        for i in range(10):
+            test_id = uuid.uuid4()
+            session.execute(
+                "INSERT INTO test_data (id, name, value) VALUES (%s, %s, %s)",
+                (test_id, f"TestRow_{i}", i * 10)
+            )
+
+        # Query with small fetch_size
+        from cassandra.query import SimpleStatement
+        query = SimpleStatement("SELECT * FROM test_data", fetch_size=3)
+
+        wrapper = await aexecute(session, query)
+
+        # Verify column_names
+        assert 'id' in wrapper.column_names
+        assert 'name' in wrapper.column_names
+        assert 'value' in wrapper.column_names
+
+        # Verify has_more_pages is True initially (10 rows > 3 fetch_size)
+        assert wrapper.has_more_pages is True
+
+        # Verify paging_state is not None
+        assert wrapper.paging_state is not None
+
+        # Verify current_rows contains fetch_size rows
+        assert len(wrapper.current_rows) == 3
+
+        # Iterate through all rows
+        result = []
+        async for row in wrapper:
+            result.append(row)
+
+        assert len(result) == 10
+
+    async def test_empty_result_set_from_real_query(self, cassandra_integration_session):
+        """Test empty result set from real Cassandra query."""
+        session = cassandra_integration_session
+
+        # Query that returns no results (use ALLOW FILTERING for non-indexed column)
+        wrapper = await aexecute(
+            session,
+            "SELECT * FROM test_data WHERE name = %s ALLOW FILTERING",
+            ("NonexistentName",)
+        )
+
+        # Verify iteration over empty result set works
+        result = []
+        async for row in wrapper:
+            result.append(row)
+
+        assert result == []
+        assert len(result) == 0
+
+    async def test_query_parameters_with_real_data(self, cassandra_integration_session):
+        """Test parameterized queries with real Cassandra."""
+        session = cassandra_integration_session
+
+        # Insert specific test data
+        test_id = uuid.uuid4()
+        session.execute(
+            "INSERT INTO test_data (id, name, value) VALUES (%s, %s, %s)",
+            (test_id, "SpecificName", 999)
+        )
+
+        # Query with parameters
+        wrapper = await aexecute(
+            session,
+            "SELECT * FROM test_data WHERE id = %s",
+            (test_id,)
+        )
+
+        # Collect results
+        result = []
+        async for row in wrapper:
+            result.append(row)
+
+        assert len(result) == 1
+        assert result[0].id == test_id
+        assert result[0].name == "SpecificName"
+        assert result[0].value == 999
