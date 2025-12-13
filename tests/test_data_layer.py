@@ -8,6 +8,8 @@ import pytest
 from chainlit.types import Feedback, PageInfo, Pagination, ThreadFilter
 from chainlit.user import User
 
+from chainlit_cassandra_data_layer.data import smallest_uuid7_for_datetime
+
 
 @pytest.mark.asyncio
 class TestUserOperations:
@@ -600,20 +602,22 @@ class TestThreadOperations:
             # Insert multiple old duplicates for this thread
             for j in range(25):  # Create enough duplicates to fill a batch
                 old_timestamp = dt.now() - timedelta(hours=1 + j)
+                old_activity_uuid = smallest_uuid7_for_datetime(old_timestamp)
+                created_at_uuid = smallest_uuid7_for_datetime(dt.now())
 
                 insert_query = f"""
                     INSERT INTO {data_layer._table_threads_by_user_activity}
-                    (user_id, last_activity_at, thread_id, thread_name, thread_created_at)
+                    (user_id, activity_at, thread_id, thread_name, thread_created_at)
                     VALUES (%s, %s, %s, %s, %s)
                 """
                 await data_layer._aexecute_prepared(
                     insert_query,
                     (
                         user_id_uuid,
-                        old_timestamp,
+                        old_activity_uuid,
                         thread_id_uuid,
                         f"Thread {i}",
-                        dt.now(),
+                        created_at_uuid,
                     ),
                 )
 
