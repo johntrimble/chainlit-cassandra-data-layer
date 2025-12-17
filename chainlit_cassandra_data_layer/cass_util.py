@@ -1,5 +1,5 @@
 from typing import Any, Generic, Protocol, TypeVar
-from cassandra.cluster import ResultSet
+from cassandra.cluster import ResultSet, Session
 
 
 # Generic type for row (namedtuple by default, but configurable via row_factory)

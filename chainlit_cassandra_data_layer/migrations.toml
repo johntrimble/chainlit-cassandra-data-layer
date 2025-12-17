@@ -91,21 +91,24 @@ statements = [
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.threads_by_user_activity (
     user_id UUID,
-    activity_at UUID,
+    partition_bucket_start TIMESTAMP,
+    clustering_bucket_start TIMESTAMP,
+    thread_created_at UUID,             -- uuidv7 timestamp
+    activity_at UUID,                   -- uuidv7 timestamp
     thread_id UUID,
     thread_name TEXT,
-    thread_created_at UUID,
-    PRIMARY KEY (user_id, activity_at, thread_id)
-  ) WITH CLUSTERING ORDER BY (activity_at DESC, thread_id ASC);
+    PRIMARY KEY ((user_id, partition_bucket_start), clustering_bucket_start, thread_created_at)
+  ) WITH CLUSTERING ORDER BY (clustering_bucket_start DESC, thread_created_at DESC);
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.user_activity_by_thread (
     thread_id UUID,
-    activity_at UUID,
+    clustering_bucket_start TIMESTAMP,
+    activity_at UUID,                   -- uuidv7 timestamp
     user_id UUID STATIC,
     thread_name TEXT STATIC,
-    thread_created_at UUID STATIC,
-    PRIMARY KEY (thread_id, activity_at)
-  ) WITH CLUSTERING ORDER BY (activity_at DESC);
-  """
+    thread_created_at UUID STATIC,      -- uuidv7 timestamp
+    PRIMARY KEY (thread_id, clustering_bucket_start)
+  ) WITH CLUSTERING ORDER BY (clustering_bucket_start DESC);
+  """,
 ]

@@ -367,6 +367,7 @@ dependencies = [
     { name = "cassandra-asyncio-driver" },
     { name = "chainlit" },
     { name = "msgpack" },
+    { name = "pybase62" },
     { name = "uuid-utils" },
     { name = "uuid6" },
 ]
@@ -391,6 +392,7 @@ requires-dist = [
     { name = "cassandra-asyncio-driver" },
     { name = "chainlit" },
     { name = "msgpack", specifier = ">=1.0.0" },
+    { name = "pybase62", specifier = ">=1.0.0" },
     { name = "uuid-utils" },
     { name = "uuid6" },
 ]
@@ -2316,6 +2318,14 @@ name = "pure-sasl"
 version = "0.6.2"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/83/b7/a0d688f86c869073cc28c0640899394a1cf68a6d87ee78a09565e9037da6/pure-sasl-0.6.2.tar.gz", hash = "sha256:53c1355f5da95e2b85b2cc9a6af435518edc20c81193faa0eea65fdc835138f4", size = 11617, upload-time = "2019-10-14T21:43:57.13Z" }
+
+[[package]]
+name = "pybase62"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/11/07/8fe498201daece90af1725cf48d5de9d1a87ea8d457df52c986ef926ff33/pybase62-1.0.0-py3-none-any.whl", hash = "sha256:60539ad956ec9e9de091bc7ae88c9550bc2fa17f503050cf34d021b75e73cb27", size = 4913, upload-time = "2023-05-29T08:43:05.677Z" },
+]
 
 [[package]]
 name = "pydantic"

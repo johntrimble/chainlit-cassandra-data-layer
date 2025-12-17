@@ -1,13 +1,14 @@
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
 import uuid
 import uuid6
 import uuid_utils
 import uuid_utils.compat
-from datetime import UTC, datetime
-from typing import Any, Collection, Optional, Sequence, Tuple, TypeVar, TypedDict, cast
-
+from datetime import UTC, datetime, timedelta
+from typing import Any, AsyncGenerator, AsyncIterable, AsyncIterator, Collection, Literal, NotRequired, Optional, Sequence, Tuple, TypeVar, TypedDict, cast
+import base62
 import aiofiles
 import msgpack
 from cassandra.cluster import EXEC_PROFILE_DEFAULT, PreparedStatement, Session
@@ -148,6 +149,29 @@ def smallest_uuid7_for_datetime(dt: datetime) -> uuid.UUID:
 
     return uuid.UUID(int=uuid_int)
 
+def largest_uuid7_for_datetime(dt: datetime) -> uuid.UUID:
+    """Get the largest UUIDv7 for the given datetime."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    else:
+        dt = dt.astimezone(UTC)
+    epoch_millis = int(dt.timestamp() * 1000)
+
+    # Construct the largest UUID7 for this timestamp
+    # First 48 bits: timestamp in milliseconds
+    timestamp_ms = epoch_millis & 0xFFFFFFFFFFFF
+    uuid_int = timestamp_ms << 80
+
+    # Next 16 bits: version 7 (0x7000) with all other bits as 1
+    uuid_int |= 0x7000 << 64
+    uuid_int |= 0x0FFF << 64  # Set lower 12 bits to 1
+
+    # Next 64 bits: variant (0b10) in high 2 bits, all other bits as 1
+    uuid_int |= 0b10 << 62
+    uuid_int |= (1 << 62) - 1  # Set lower 62 bits to 1
+
+    return uuid.UUID(int=uuid_int)
+
 
 def to_uuid_utils_uuid(u: str | uuid.UUID | uuid_utils.UUID) -> uuid_utils.UUID:
     """Convert a UUID input to a uuid_utils.UUID object."""
@@ -218,6 +242,230 @@ def datetime_to_isoformat(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def add_timezone_if_missing(dt: datetime) -> datetime:
+    """Add UTC timezone to naive datetime objects."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+class TimeBucketStrategy:
+    def get_bucket(self, dt: datetime|uuid.UUID) -> Tuple[datetime, datetime]:
+        ...
+
+def _calc_bucket_segment_start(segment_size:timedelta, dt:datetime, start_time: datetime) -> datetime:
+    """
+    Returns the datetime of where a bucket segments starts for a given datetime.
+    """
+    if start_time is None:
+        start_time = datetime(1970, 1, 1, tzinfo=UTC)
+    else:
+        start_time = add_timezone_if_missing(start_time)
+
+    dt = add_timezone_if_missing(dt)
+    delta = dt - start_time
+    total_seconds = delta.total_seconds()
+    segment_seconds = segment_size.total_seconds()
+    segment_index = int(total_seconds // segment_seconds)
+    segment_start_seconds = segment_index * segment_seconds
+    segment_start = start_time + timedelta(seconds=segment_start_seconds)
+    return segment_start
+
+
+class BasicActivityBucketStrategy(TimeBucketStrategy):
+    def __init__(
+        self,
+        partition_bucket_size: timedelta,
+        clustering_bucket_size: timedelta,
+        start_time: datetime | None = None,
+    ):
+        self.partition_bucket_size = partition_bucket_size
+        self.clustering_bucket_size = clustering_bucket_size
+
+        if start_time is None:
+            start_time = datetime(1970, 1, 1, tzinfo=UTC)
+        self.start_time = add_timezone_if_missing(start_time)
+
+        assert self.partition_bucket_size >= self.clustering_bucket_size, "Partition bucket size must be >= clustering bucket size"
+
+    def get_bucket(self, dt: datetime|uuid.UUID) -> Tuple[datetime, datetime]:
+        if isinstance(dt, uuid.UUID):
+            dt = uuid7_to_datetime(dt)
+
+        partition_bucket = _calc_bucket_segment_start(
+            self.partition_bucket_size, dt, start_time=self.start_time
+        )
+
+        clustering_bucket = _calc_bucket_segment_start(
+            self.clustering_bucket_size, dt, start_time=partition_bucket
+        )
+
+        return (partition_bucket, clustering_bucket)
+
+
+# def list_buckets_desc(
+#     strategy: TimeBucketStrategy,
+#     start: datetime,
+#     end: datetime,
+# ):
+#     if end > start:
+#         start, end = end, start
+
+#     partition_bucket, clustering_bucket = strategy.get_bucket(start)
+
+
+
+
+class ThreadCursor(TypedDict):
+    start: uuid.UUID
+    thread_start: NotRequired[uuid.UUID]
+
+
+@dataclass
+class CollectThreadListResult:
+    selected_rows: Sequence[Any]
+    next_cursor: Optional[ThreadCursor] = None
+    duplicate_rows: Sequence[Any] = None
+
+
+async def collect_thread_list_results(pagination: Pagination, list_threads_results: AsyncIterable[tuple[datetime,  AsyncIterable[Any]]], cursor: ThreadCursor | None = None, max_clustering_size: int = 1_000, filters: ThreadFilter | None = None) -> CollectThreadListResult:
+    start: uuid.UUID
+    if (cursor or {}).get("start"):
+        start = cursor["start"]
+    else:
+        # Make largest possible UUID
+        start = uuid.UUID("ffffffff-ffff-7fff-bfff-ffffffffffff")
+    
+    thread_start: datetime | None = (cursor or {}).get("thread_start")
+
+    class RowProcessor:
+        def __init__(self, page_size: int = 100, max_clustering_size: int = 1000):
+            self.collected = []
+            self.group = []
+            self.page_size = page_size
+            self.next_cursor = None
+            self.max_clustering_size = max_clustering_size
+            self.clustering_index = 0
+            self.cursor_thread_created_at = None
+            self.stopped_in_middle_of_group = False
+            self.seen_threads = set()
+            self.duplicate_rows = []
+        
+        def cycle_group(self):
+            self.group.sort(key=lambda r: r.activity_at, reverse=True)
+            self.collected.extend(self.group)
+            self.group = []
+
+        def handle_row(self, row: Any) -> bool:
+            # Skip duplicate threads
+            if row.thread_id in self.seen_threads:
+                self.duplicate_rows.append(row)
+                return False
+            self.seen_threads.add(row.thread_id)
+
+            # Skip rows that don't match the filter
+            if filters is not None:
+                search_str = (filters.search or "").lower()
+                if search_str not in (row.thread_name or "").lower():
+                    return False
+
+            starting_from_middle_of_clustering_group = thread_start is not None and self.clustering_index == 0
+            if starting_from_middle_of_clustering_group:
+                # We are in the first clustering group and have a thread_start
+                # to respect. Only include rows with created_at <= thread_start.
+                if row.thread_created_at <= thread_start:
+                    self.group.append(row)
+            elif row.activity_at <= start:
+                self.group.append(row)
+            
+            # This is an edge case where the previous cluster perfectly filled
+            # out the page of results, but we still needed to process one more
+            # row so that we could determine if we needed a next cursor.
+            if len(self.collected) == self.page_size:
+                return True
+
+            have_full_page_of_results = len(self.collected) + len(self.group) > self.page_size
+            over_max_clustering_size = len(self.group) > self.max_clustering_size
+
+            if (have_full_page_of_results and over_max_clustering_size):
+                # There are too many rows for this clustering group for us to
+                # read them all. Instead we stop here and return a cursor to 
+                # this position in the data. This means we will not get perfect
+                # activity ordering, but it prevents us from pulling down an
+                # arbitrary amount of data.
+                self.stopped_in_middle_of_group = True
+                return True
+            return False
+
+        def start_partition(self, dt: datetime) -> bool:
+            return False
+
+        def start_cluster(self, dt: datetime) -> bool:
+            # Make sure we reset the group in end_cluster
+            assert self.group == []
+            return False
+
+        def end_partition(self) -> bool:
+            return False
+
+        def end_cluster(self) -> bool:
+            self.clustering_index += 1
+            current_group = self.group
+            current_group_sorted = sorted(current_group, key=lambda r: r.activity_at, reverse=True)
+            self.group = []
+            current_size = len(self.collected) + len(current_group)
+
+            if current_size > self.page_size and not self.stopped_in_middle_of_group:
+                number_to_add = self.page_size - len(self.collected)
+                self.collected.extend(current_group_sorted[:number_to_add])
+                next_row = current_group_sorted[number_to_add]
+                self.next_cursor = {
+                    "start": next_row.activity_at,
+                }
+            elif current_size > self.page_size and self.stopped_in_middle_of_group:
+                number_to_add = self.page_size - len(self.collected)
+                self.collected.extend(
+                    sorted(current_group[:number_to_add], key=lambda r: r.activity_at, reverse=True)
+                )
+                next_row = current_group[number_to_add]
+                self.next_cursor = {
+                    "start": next_row.clustering_bucket_start,
+                    "thread_start": next_row.thread_created_at
+                }
+            else:
+                # Adding this group will not put us over the page size
+                self.collected.extend(current_group_sorted)
+
+    rp = RowProcessor(page_size=pagination.first, max_clustering_size=max_clustering_size)
+    should_stop = False
+    cluster_group = None
+    async for partition_start, rs in list_threads_results:
+        should_stop = rp.start_partition(partition_start) or should_stop
+        any_rows = False
+        async for row in rs:
+            any_rows = True
+            if cluster_group != row.clustering_bucket_start:
+                if cluster_group is not None:
+                    should_stop = rp.end_cluster() or should_stop
+                should_stop = rp.start_cluster(row.clustering_bucket_start) or should_stop
+                cluster_group = row.clustering_bucket_start
+            should_stop = rp.handle_row(row) or should_stop
+            if should_stop:
+                break
+        if any_rows:
+            should_stop = rp.end_cluster() or should_stop
+            cluster_group = None
+        should_stop = rp.end_partition() or should_stop
+        if should_stop:
+            break
+
+    return CollectThreadListResult(
+        duplicate_rows=rp.duplicate_rows,
+        selected_rows=rp.collected,
+        next_cursor=rp.next_cursor
+    )
+
+
 class CassandraDataLayer(BaseDataLayer):
     """Cassandra-backed data layer for Chainlit."""
 
@@ -228,6 +476,7 @@ class CassandraDataLayer(BaseDataLayer):
         *,
         keyspace: str | None = None,
         default_consistency_level: int | None = None,
+        activity_bucket_strategy: TimeBucketStrategy | None = None,
         log: logging.Logger|None = None,
     ):
         """Initialize the Cassandra data layer.
@@ -252,6 +501,14 @@ class CassandraDataLayer(BaseDataLayer):
             self.log = log
         else:
             self.log = logging.getLogger(__name__)
+
+        # Setup bucketing for the activity table
+        if activity_bucket_strategy is None:
+            activity_bucket_strategy = BasicActivityBucketStrategy(
+                partition_bucket_size=timedelta(days=60),
+                clustering_bucket_size=timedelta(days=10),
+            )
+        self.activity_bucket_strategy = activity_bucket_strategy
 
         # Determine the consistency level
         ep = session.cluster.profile_manager.profiles[EXEC_PROFILE_DEFAULT]
@@ -303,10 +560,13 @@ class CassandraDataLayer(BaseDataLayer):
             self._prepared_statements[query] = statement
         return statement
 
-    async def _aexecute_prepared(self, query: str, parameters: tuple[Any, ...] = ()) -> AsyncResultSet:
+    async def _aexecute_prepared(self, query: str, parameters: tuple[Any, ...] = (), fetch_size: int | None = None) -> AsyncResultSet:
         """Execute a prepared statement asynchronously with the provided parameters."""
         statement = self._get_prepared_statement(query)
-        return await aexecute(self.session, statement, parameters)
+        statement = statement.bind(parameters)
+        if fetch_size is not None:
+            statement.fetch_size = fetch_size 
+        return await aexecute(self.session, statement, None)
 
     def _batch_add_prepared(
         self, batch: BatchStatement, query: str, parameters: tuple[Any, ...]
@@ -374,15 +634,17 @@ class CassandraDataLayer(BaseDataLayer):
         # Create our activity_at if not provided
         if activity_at is None:
             activity_at = uuid7()
+        
+        _, clustering_bucket = self.activity_bucket_strategy.get_bucket(activity_at)
 
         insert_query = f"""
         INSERT INTO {self._table_user_activity_by_thread}
-        (user_id, thread_id, activity_at)
-        VALUES (%s, %s, %s)
+        (thread_id, clustering_bucket_start, activity_at, user_id)
+        VALUES (%s, %s, %s, %s)
         """
 
         await self._aexecute_prepared(
-            insert_query, (user_id, thread_id, activity_at)
+            insert_query, (thread_id, clustering_bucket, activity_at, user_id)
         )
 
         return activity_at
@@ -406,37 +668,47 @@ class CassandraDataLayer(BaseDataLayer):
         # Step 2: Add to batch delete old activities from threads_by_user_activity
         batch = BatchStatement(batch_type=BatchType.UNLOGGED)
         old_activities = activities[1:]  # Exclude latest activity
+        delete_user_activity_query = f"""
+        DELETE FROM {self._table_threads_by_user_activity}
+        WHERE user_id = %s AND partition_bucket_start = %s AND clustering_bucket_start = %s AND thread_created_at = %s
+        """
         for old_activity in old_activities:
-            delete_user_activity_query = f"""
-            DELETE FROM {self._table_threads_by_user_activity}
-            WHERE user_id = %s AND activity_at = %s AND thread_id = %s
-            """
+            partition_bucket, clustering_bucket = self.activity_bucket_strategy.get_bucket(
+                old_activity["activity_at"]
+            )
             self._batch_add_prepared(
                 batch,
                 delete_user_activity_query,
                 (
                     user_id,
-                    old_activity['activity_at'],
-                    thread_id,
+                    partition_bucket,
+                    clustering_bucket,
+                    old_activity["created_at"],
                 )
             )
 
         # Step 3: Add to batch insert latest activity into threads_by_user_activity
-        latest_activity = activities[0] if activities else None
+        latest_activity = activities[0]
+        print(latest_activity)
+        partition_bucket, clustering_bucket = self.activity_bucket_strategy.get_bucket(
+            latest_activity['activity_at']
+        )
         insert_query = f"""
         INSERT INTO {self._table_threads_by_user_activity}
-        (user_id, activity_at, thread_id, thread_name, thread_created_at)
-        VALUES (%s, %s, %s, %s, %s)
+        (user_id, partition_bucket_start, clustering_bucket_start, thread_created_at, activity_at, thread_id, thread_name)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         self._batch_add_prepared(
             batch,
             insert_query,
             (
                 user_id,
+                partition_bucket,
+                clustering_bucket,
+                latest_activity['created_at'],
                 latest_activity['activity_at'],
                 thread_id,
                 latest_activity['name'],
-                latest_activity['created_at'],
             )
         )
 
@@ -453,16 +725,19 @@ class CassandraDataLayer(BaseDataLayer):
         # worse if we do it that way.
         delete_by_thread_query = f"""
         DELETE FROM {self._table_user_activity_by_thread}
-        WHERE thread_id = %s AND activity_at = %s
+        WHERE thread_id = %s AND clustering_bucket_start = %s
         """
         tasks = []
         for activity in activities:
+            _, clustering_bucket = self.activity_bucket_strategy.get_bucket(
+                activity['activity_at']
+            )
             tasks.append(
                 self._aexecute_prepared(
                     delete_by_thread_query,
                     (
                         activity['thread_id'],
-                        activity['activity_at'],
+                        clustering_bucket,
                     )
                 )
             )
@@ -527,6 +802,22 @@ class CassandraDataLayer(BaseDataLayer):
             return None
 
         return row
+    
+    async def _get_user_created_at(self, user_id: uuid.UUID | str) -> datetime | None:
+        """Get user from context or database by user ID."""
+        # Try to get user from context
+        if context.session and context.session.user and hasattr(context.session.user, "createdAt"):
+            if context.session.user.id == str(user_id):
+                return context.session.user.createdAt
+
+        # Fallback to database lookup
+        identifier = await self._get_user_identifier_for_id(user_id)
+        if identifier is None:
+            return None
+        user = await self.get_user(identifier)
+        if user is None:
+            return None
+        return isoformat_to_datetime(user.createdAt)
 
     async def get_user(self, identifier: str) -> PersistedUser | None:
         """Get a user by identifier."""
@@ -1647,9 +1938,208 @@ class CassandraDataLayer(BaseDataLayer):
                 )
 
         await cleanup_thread()
+
+
+    async def _find_partitions_for_user_descending(
+        self, user_id: uuid.UUID, start: datetime = None
+    ) -> AsyncIterator[datetime]:
+        if start is None:
+            start = datetime.now(tz=UTC)
     
+        first_partition, _ = self.activity_bucket_strategy.get_bucket(start)
+
+        # There cannot be any partitions before the user's creation date (since
+        # a user cannot have activity before they exist).)
+        created_at = await self._get_user_created_at(user_id)
+        if not created_at:
+            raise ValueError(f"User with id {str(user_id)} does not exist")
+        
+        last_bucket, _ = self.activity_bucket_strategy.get_bucket(created_at)
+
+        current_partition = first_partition
+        while current_partition >= last_bucket:
+            yield current_partition
+            current_partition, _ = self.activity_bucket_strategy.get_bucket(
+                current_partition - timedelta(milliseconds=1)
+            )
+
+
+    def decode_thread_cursor(self, cursor: str) -> ThreadCursor:
+        # Base62 decode
+        cursor_bytes = base62.decodebytes(cursor)
+        cursor_unpacked = _unpack_metadata(cursor_bytes)
+        cursor = {}
+        if "start" in cursor_unpacked:
+            cursor["start"] = uuid.UUID(bytes=cursor_unpacked["start"])
+        if "thread_start" in cursor_unpacked:
+            cursor["thread_start"] = uuid.UUID(bytes=cursor_unpacked["thread_start"])
+
+        return cursor
+
+
+    def encode_thread_cursor(self, cursor: ThreadCursor) -> str:
+        # Base62 encode
+        dict_to_encode = {}
+        if cursor.get("start"):
+            dict_to_encode["start"] = cursor["start"].bytes
+        if cursor.get("thread_start"):
+            dict_to_encode["thread_start"] = cursor["thread_start"].bytes
+        cursor_bytes = _pack_metadata(dict_to_encode)
+        encoded_cursor = base62.encodebytes(cursor_bytes)
+        return encoded_cursor
+
 
     async def list_threads(
+        self, pagination: Pagination, filters: ThreadFilter
+    ):
+        if not filters.userId:
+            raise ValueError("userId is required")
+        
+        if filters.feedback is not None:
+            self.log.warning(
+                "Cassandra: filters on feedback not supported. "
+                "Feedback filtering requires full thread data with steps."
+            )
+    
+        # Decode the cursor if we have one
+        if pagination.cursor:
+            cursor_dict = self.decode_thread_cursor(pagination.cursor)
+        else:
+            cursor_dict = None
+        thread_start = (cursor_dict or {}).get("thread_start") or uuid7(datetime=add_timezone_if_missing(datetime.max))
+        start = (cursor_dict or {}).get("start") or uuid7(datetime=datetime.now(tz=UTC))
+
+        # Figure out how many items to fetch
+        page_size = pagination.first if pagination.first else MAX_THREADS_PER_PAGE
+        # Get 20% extra to account for duplicate results and consuming entire clustering buckets
+        fetch_size = int(page_size * 1.20)
+        # If filtering with a search string, double the fetch size again as most
+        # results will be filtered out
+        if filters.search:
+            fetch_size = min(fetch_size * 2, MAX_THREADS_PER_PAGE)
+        
+        # Get the user ID as a UUID to include in the query
+        user_id = to_uuid(filters.userId)
+
+        select_threads_query = f"""
+        SELECT clustering_bucket_start, thread_id, thread_name, thread_created_at, activity_at
+        FROM {self._table_threads_by_user_activity}
+        WHERE user_id = %s AND partition_bucket_start = %s
+        AND clustering_bucket_start < %s
+        """
+
+        # If we have a thread_start from the cursor, then we need to add an
+        # additional condition to the query to only get threads before that ID
+        # in the first clustering bucket.
+        select_threads_with_thread_start_query = f"""
+        SELECT clustering_bucket_start, thread_id, thread_name, thread_created_at, activity_at
+        FROM {self._table_threads_by_user_activity}
+        WHERE user_id = %s AND partition_bucket_start = %s
+        AND clustering_bucket_start = %s AND thread_id < %s
+        """
+                
+        async def results_gen():
+            async for partition in self._find_partitions_for_user_descending(user_id, start):
+                _, clustering_bucket_start = self.activity_bucket_strategy.get_bucket(start)
+                if cursor_dict and "thread_start" in cursor_dict:
+                    async def join():
+                        _, clustering_bucket_start = self.activity_bucket_strategy.get_bucket(start)
+                        rs = await self._aexecute_prepared(
+                            select_threads_with_thread_start_query,
+                            (
+                                user_id,
+                                partition,
+                                clustering_bucket_start,
+                                thread_start,
+                            ),
+                            fetch_size=fetch_size,
+                        )
+                        async for row in rs:
+                            yield row
+                        # Now fetch the rest of the partition normally
+                        rs2 = await self._aexecute_prepared(
+                            select_threads_query,
+                            (
+                                user_id,
+                                partition,
+                                clustering_bucket_start,
+                            ),
+                            fetch_size=fetch_size,
+                        )
+                        async for row in rs2:
+                            yield row
+                    yield partition, join()
+                else:
+                    rs = await self._aexecute_prepared(
+                        select_threads_query,
+                        (
+                            user_id,
+                            partition,
+                            clustering_bucket_start + timedelta(milliseconds=1),
+                        ),
+                        fetch_size=fetch_size,
+                    )
+                    yield partition, rs
+        
+        result = await collect_thread_list_results(
+            pagination,
+            results_gen(),
+            cursor_dict,
+            filters=filters,
+        )
+
+        # Cleanup any duplicates we found
+        if result.duplicate_rows:
+            delete_tasks = []
+            unique_duplicate_ids = set()
+            for row in result.duplicate_rows:
+                unique_duplicate_ids.add(row.thread_id)
+            for thread_id in unique_duplicate_ids:
+                delete_tasks.append(
+                    asyncio.create_task(
+                        self._sync_activity_by_user_with_activity_by_thread(
+                            thread_id=thread_id,
+                            user_id=user_id,
+                        )
+                    )
+                )
+            # TODO: Should we await these tasks or just fire and forget?
+
+        # Create our thread list
+        threads: list[ThreadDict] = []
+        for row in result.selected_rows:
+            thread_dict = ThreadDict(
+                id=str(row.thread_id),
+                createdAt=uuid7_isoformat(row.thread_created_at),
+                name=row.thread_name,
+                userId=str(user_id),  # Available from query context (partition key)
+                userIdentifier=None,
+                tags=None,
+                metadata=None,
+                steps=[],  # Empty array - UI will call get_thread when needed
+                elements=[],  # Empty array
+                # Optional fields default to None when not available from index query
+            )
+            threads.append(thread_dict)
+
+        # Create our cursor for the next page
+        next_cursor_str = None
+        if result.next_cursor:
+            next_cursor_str = self.encode_thread_cursor(result.next_cursor)
+        
+        response = PaginatedResponse(
+            pageInfo=PageInfo(
+                hasNextPage=next_cursor_str is not None,
+                startCursor=pagination.cursor,
+                endCursor=next_cursor_str,
+            ),
+            data=threads,
+        )
+
+        return response
+
+
+    async def __list_threads(
         self, pagination: Pagination, filters: ThreadFilter
     ) -> PaginatedResponse[ThreadDict]:
         """List threads for a user with efficient cursor-based pagination.
@@ -1666,7 +2156,7 @@ class CassandraDataLayer(BaseDataLayer):
         if not filters.userId:
             raise ValueError("userId is required")
 
-        # Log warning for unsupported feedback filter (like DynamoDB)
+        # Log warning for unsupported feedback filter
         if filters.feedback is not None:
             self.log.warning(
                 "Cassandra: filters on feedback not supported. "
