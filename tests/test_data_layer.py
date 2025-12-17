@@ -91,7 +91,7 @@ def make_list_threads_results_asynciterable(
 
     # Sort rows into their partitions
     results_partitioned = {}
-    for clustering_bucket, rows in results_clustering.items():
+    for _, rows in results_clustering.items():
         for row in rows:
             partition_bucket = row.partition_bucket_start
             results_partitioned.setdefault(partition_bucket, []).append(row)

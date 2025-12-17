@@ -1,4 +1,4 @@
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from cassandra.cluster import ResultSet
 
@@ -6,7 +6,7 @@ from cassandra.cluster import ResultSet
 RowT = TypeVar("RowT")
 
 
-class AsyncResultSet(Protocol, Generic[RowT]):
+class AsyncResultSet[RowT](Protocol):
     """Protocol for async iteration over Cassandra query results.
 
     This protocol defines the interface for async iteration without
@@ -45,7 +45,7 @@ class AsyncResultSet(Protocol, Generic[RowT]):
         ...
 
 
-class AsyncResultSetWrapper(Generic[RowT]):
+class AsyncResultSetWrapper[RowT]:
     """Async iterator wrapper for cassandra-driver ResultSet.
 
     Prevents event loop blocking during pagination by calling session.aexecute()
@@ -119,7 +119,7 @@ class AsyncResultSetWrapper(Generic[RowT]):
         except StopIteration:
             # Current page exhausted - check if more pages available
             if not self._current_result_set.has_more_pages:
-                raise StopAsyncIteration
+                raise StopAsyncIteration from None
 
             # Fetch next page using paging_state (fully async!)
             # Preserve all kwargs from initial call (execution_profile, timeout, etc.)
@@ -168,7 +168,7 @@ class AsyncResultSetWrapper(Generic[RowT]):
                 return next(self._current_page_iter)  # type: ignore[no-any-return]
             except StopIteration:
                 # Empty page (shouldn't happen, but handle gracefully)
-                raise StopAsyncIteration
+                raise StopAsyncIteration from None
 
     def one(self) -> RowT:
         """Return a single row from the current page of results."""

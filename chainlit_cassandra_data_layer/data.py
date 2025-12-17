@@ -1439,6 +1439,8 @@ class CassandraDataLayer(BaseDataLayer):
         """
         try:
             step_id_uuid = to_uuid(step_id)
+            if not step_id_uuid:
+                raise ValueError(f"Invalid step_id: {step_id}")
             result = await self._thread_id_for_step_id(step_id_uuid)
             if not result:
                 raise ValueError(f"Cannot delete step {step_id} - step not found")
@@ -2118,7 +2120,7 @@ class CassandraDataLayer(BaseDataLayer):
                 )
                 if cursor_dict and "thread_start" in cursor_dict:
 
-                    async def join():
+                    async def join(partition=partition):
                         _, clustering_bucket_start = (
                             self.activity_bucket_strategy.get_bucket(start)
                         )
