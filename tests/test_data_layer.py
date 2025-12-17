@@ -1,26 +1,27 @@
 """Integration tests for CassandraDataLayer."""
 
-from argparse import Namespace
 import asyncio
-from typing import Any, AsyncIterable, Callable, Sequence, Tuple
+import copy
+import random
 import uuid
+from argparse import Namespace
+from collections.abc import AsyncIterable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-import itertools
+from typing import Any
+
 import pytest
 from chainlit.types import Feedback, PageInfo, Pagination, ThreadFilter
 from chainlit.user import User
-import random
-import copy
 
 from chainlit_cassandra_data_layer.data import (
+    BasicActivityBucketStrategy,
     CollectThreadListResult,
+    ThreadCursor,
     TimeBucketStrategy,
+    collect_thread_list_results,
     smallest_uuid7_for_datetime,
     uuid7,
-    BasicActivityBucketStrategy,
-    collect_thread_list_results,
     uuid7_isoformat,
-    ThreadCursor,
     uuid7_to_datetime,
 )
 
@@ -128,7 +129,7 @@ def build_threads_by_user_activity_rows_dataset(
         current += delta
         thread_id = uuid.uuid4()
         data.append(
-            (
+            
                 Namespace(
                     activity_at=uuid7(datetime=current),
                     thread_id=thread_id,
@@ -138,7 +139,7 @@ def build_threads_by_user_activity_rows_dataset(
                         - timedelta(minutes=rand.randint(0, 7 * 24 * 60))
                     ),
                 )
-            )
+            
         )
     return data
 

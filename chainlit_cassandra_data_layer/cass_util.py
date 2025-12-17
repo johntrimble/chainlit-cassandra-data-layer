@@ -1,6 +1,6 @@
 from typing import Any, Generic, Protocol, TypeVar
-from cassandra.cluster import ResultSet, Session
 
+from cassandra.cluster import ResultSet
 
 # Generic type for row (namedtuple by default, but configurable via row_factory)
 RowT = TypeVar("RowT")
@@ -130,8 +130,9 @@ class AsyncResultSetWrapper(Generic[RowT]):
             }
 
             # Use same logic as aexecute() to get ResultSet from execute_async
-            from cassandra.cluster import ResultSet
             import asyncio
+
+            from cassandra.cluster import ResultSet
 
             future = self._session.execute_async(
                 self._query, self._params, paging_state=paging_state, **fetch_kwargs
@@ -233,8 +234,9 @@ async def aexecute(session: Any, query, params=None, **kwargs) -> AsyncResultSet
         async for row in aexecute(session, "SELECT * FROM users"):
             print(row.name)
     """
-    from cassandra.cluster import ResultSet
     import asyncio
+
+    from cassandra.cluster import ResultSet
 
     # Get ResponseFuture from execute_async (not aexecute)
     future = session.execute_async(query, params, **kwargs)

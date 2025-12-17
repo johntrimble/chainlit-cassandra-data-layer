@@ -7,7 +7,6 @@ AsyncResultSetWrapper class for async iteration over Cassandra query results.
 import asyncio
 import uuid
 from typing import NamedTuple
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

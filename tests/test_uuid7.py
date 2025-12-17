@@ -1,8 +1,9 @@
-from datetime import datetime, UTC
+from datetime import UTC, datetime
+
 from chainlit_cassandra_data_layer.data import (
-    uuid7_to_datetime,
     smallest_uuid7_for_datetime,
     uuid7,
+    uuid7_to_datetime,
 )
 
 

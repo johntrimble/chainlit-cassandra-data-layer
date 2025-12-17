@@ -1,32 +1,29 @@
 import asyncio
-from dataclasses import dataclass
 import json
 import logging
 import uuid
-import uuid6
-import uuid_utils
-import uuid_utils.compat
-from datetime import UTC, datetime, timedelta
-from typing import (
-    Any,
-    AsyncGenerator,
+from collections.abc import (
     AsyncIterable,
     AsyncIterator,
     Collection,
-    Literal,
-    NotRequired,
-    Optional,
     Sequence,
-    Tuple,
-    TypeVar,
+)
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import (
+    Any,
+    NotRequired,
     TypedDict,
     cast,
 )
-import base62  # type: ignore[import-untyped]
+
 import aiofiles
+import base62  # type: ignore[import-untyped]
 import msgpack
+import uuid_utils
+import uuid_utils.compat
 from cassandra.cluster import EXEC_PROFILE_DEFAULT, PreparedStatement, Session
-from cassandra.query import BatchStatement, BatchType, SimpleStatement
+from cassandra.query import BatchStatement, BatchType
 from chainlit.context import context
 from chainlit.data.base import BaseDataLayer
 from chainlit.data.storage_clients.base import BaseStorageClient
@@ -44,7 +41,7 @@ from chainlit.types import (
 )
 from chainlit.user import PersistedUser, User
 
-from chainlit_cassandra_data_layer.cass_util import aexecute, AsyncResultSet
+from chainlit_cassandra_data_layer.cass_util import AsyncResultSet, aexecute
 from chainlit_cassandra_data_layer.migration import MigrationManager
 
 # Import for runtime usage (isinstance checks)
@@ -59,7 +56,7 @@ except ImportError:
 MAX_THREADS_PER_PAGE = 50
 
 
-def first_exc(items: Collection) -> Optional[Exception]:
+def first_exc(items: Collection) -> Exception | None:
     for item in items:
         if isinstance(item, Exception):
             return item
@@ -119,8 +116,8 @@ class _ThreadActivity(TypedDict):
     user_id: uuid.UUID
     thread_id: uuid.UUID
     activity_at: uuid.UUID
-    created_at: Optional[uuid.UUID]
-    name: Optional[str]
+    created_at: uuid.UUID | None
+    name: str | None
 
 
 def uuid7(*, time_ms: int | None = None, datetime: datetime | None = None) -> uuid.UUID:
@@ -272,7 +269,7 @@ def add_timezone_if_missing(dt: datetime) -> datetime:
 
 
 class TimeBucketStrategy:
-    def get_bucket(self, dt: datetime | uuid.UUID) -> Tuple[datetime, datetime]:
+    def get_bucket(self, dt: datetime | uuid.UUID) -> tuple[datetime, datetime]:
         raise NotImplementedError("Subclasses must implement get_bucket")
 
 
@@ -315,7 +312,7 @@ class BasicActivityBucketStrategy(TimeBucketStrategy):
             "Partition bucket size must be >= clustering bucket size"
         )
 
-    def get_bucket(self, dt: datetime | uuid.UUID) -> Tuple[datetime, datetime]:
+    def get_bucket(self, dt: datetime | uuid.UUID) -> tuple[datetime, datetime]:
         if isinstance(dt, uuid.UUID):
             dt = uuid7_to_datetime(dt)
 
@@ -349,7 +346,7 @@ class ThreadCursor(TypedDict):
 @dataclass
 class CollectThreadListResult:
     selected_rows: Sequence[Any]
-    next_cursor: Optional[ThreadCursor] = None
+    next_cursor: ThreadCursor | None = None
     duplicate_rows: Sequence[Any] | None = None
 
 
@@ -947,7 +944,7 @@ class CassandraDataLayer(BaseDataLayer):
 
     async def _thread_id_for_step_id(
         self, step_id: uuid.UUID | str
-    ) -> Tuple[uuid.UUID, uuid.UUID | None] | None:
+    ) -> tuple[uuid.UUID, uuid.UUID | None] | None:
         """Get thread_id for a given step_id.
 
         This is needed to locate the step since steps are keyed by (thread_id, id).
@@ -963,7 +960,7 @@ class CassandraDataLayer(BaseDataLayer):
             return None
         return (row.thread_id, row.deleted_at)
 
-    def _thread_id_from_context(self) -> Optional[uuid.UUID]:
+    def _thread_id_from_context(self) -> uuid.UUID | None:
         """Get thread_id from context, if available."""
         thread_id = context.session.thread_id if context.session else None
         if thread_id is None:
@@ -977,7 +974,7 @@ class CassandraDataLayer(BaseDataLayer):
 
     async def _current_thread_id_or_lookup_by_step(
         self, step_id: uuid.UUID | str
-    ) -> Optional[uuid.UUID]:
+    ) -> uuid.UUID | None:
         """Get thread_id from context, or lookup by step_id if not available."""
         thread_id = self._thread_id_from_context()
         if thread_id is not None:
@@ -1237,7 +1234,7 @@ class CassandraDataLayer(BaseDataLayer):
             await self._aexecute_prepared(delete_query, (thread_id_uuid, element_uuid))
         except:
             self.log.exception(
-                f"Error deleting element",
+                "Error deleting element",
                 extra={"element_id": element_id, "thread_id": thread_id},
             )
             raise
@@ -1520,7 +1517,7 @@ class CassandraDataLayer(BaseDataLayer):
 
             await cleanup_step()
         except Exception as e:
-            self.log.exception(f"Error deleting step", extra={"step_id": str(step_id)})
+            self.log.exception("Error deleting step", extra={"step_id": str(step_id)})
             raise e
 
     # Thread methods
@@ -1711,9 +1708,9 @@ class CassandraDataLayer(BaseDataLayer):
             # cleanup to ensure the thread is removed.
             try:
                 await self.delete_thread(thread_id)
-            except Exception as e:
+            except Exception:
                 self.log.exception(
-                    f"Error cleaning up deleted thread", extra={"thread_id": thread_id}
+                    "Error cleaning up deleted thread", extra={"thread_id": thread_id}
                 )
             raise ValueError(f"Cannot update deleted thread {thread_id}")
 
@@ -1907,7 +1904,7 @@ class CassandraDataLayer(BaseDataLayer):
             activity_at, user_id = activity_at_and_user_ids[index]
             if isinstance(result, BaseException):
                 self.log.error(
-                    f"Error deleting activity",
+                    "Error deleting activity",
                     extra={
                         "thread_id": str(thread_id),
                         "user_id": str(user_id),
@@ -1984,7 +1981,7 @@ class CassandraDataLayer(BaseDataLayer):
             for index, result in enumerate(result_step_deletions):
                 if isinstance(result, BaseException):
                     self.log.error(
-                        f"Error deleting step during thread deletion",
+                        "Error deleting step during thread deletion",
                         extra={
                             "thread_id": str(thread_id_uuid),
                             "step_id": str(step_ids[index]),
