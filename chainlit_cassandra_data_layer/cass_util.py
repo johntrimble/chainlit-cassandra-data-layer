@@ -117,7 +117,7 @@ class AsyncResultSetWrapper(Generic[RowT]):
         """
         # Try to get next row from current page
         try:
-            return next(self._current_page_iter)
+            return next(self._current_page_iter)  # type: ignore[no-any-return]
         except StopIteration:
             # Current page exhausted - check if more pages available
             if not self._current_result_set.has_more_pages:
@@ -165,14 +165,14 @@ class AsyncResultSetWrapper(Generic[RowT]):
 
             # Return first row from new page
             try:
-                return next(self._current_page_iter)
+                return next(self._current_page_iter)  # type: ignore[no-any-return]
             except StopIteration:
                 # Empty page (shouldn't happen, but handle gracefully)
                 raise StopAsyncIteration
     
     def one(self) -> RowT:
         """Return a single row from the current page of results."""
-        return self._current_result_set.one()
+        return self._current_result_set.one()  # type: ignore[no-any-return]
 
     # Expose useful ResultSet properties for inspection and debugging
 
@@ -184,12 +184,12 @@ class AsyncResultSetWrapper(Generic[RowT]):
     @property
     def has_more_pages(self) -> bool:
         """Check if more pages are available from the underlying ResultSet."""
-        return self._current_result_set.has_more_pages
+        return self._current_result_set.has_more_pages  # type: ignore[no-any-return]
 
     @property
     def current_rows(self) -> list[Any]:
         """Current page rows from the underlying ResultSet."""
-        return self._current_result_set.current_rows
+        return self._current_result_set.current_rows  # type: ignore[no-any-return]
 
     @property
     def paging_state(self) -> Any:
