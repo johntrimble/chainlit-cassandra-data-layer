@@ -1,10 +1,16 @@
 from datetime import datetime, UTC
-from chainlit_cassandra_data_layer.data import uuid7_to_datetime, smallest_uuid7_for_datetime, uuid7
+from chainlit_cassandra_data_layer.data import (
+    uuid7_to_datetime,
+    smallest_uuid7_for_datetime,
+    uuid7,
+)
+
 
 def test_uuid7_to_datetime():
     dt = datetime(year=2025, month=11, day=11, tzinfo=UTC)
     id = uuid7(time_ms=int(dt.timestamp() * 1000))
     assert uuid7_to_datetime(id) == dt
+
 
 def test_smallest_uuid7_for_datetime():
     dt = datetime(year=2025, month=11, day=11, tzinfo=UTC)

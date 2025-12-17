@@ -3,7 +3,7 @@ from cassandra.cluster import ResultSet, Session
 
 
 # Generic type for row (namedtuple by default, but configurable via row_factory)
-RowT = TypeVar('RowT')
+RowT = TypeVar("RowT")
 
 
 class AsyncResultSet(Protocol, Generic[RowT]):
@@ -16,11 +16,9 @@ class AsyncResultSet(Protocol, Generic[RowT]):
     current_rows and paging_state properties.
     """
 
-    def __aiter__(self) -> 'AsyncResultSet[RowT]':
-        ...
+    def __aiter__(self) -> "AsyncResultSet[RowT]": ...
 
-    async def __anext__(self) -> RowT:
-        ...
+    async def __anext__(self) -> RowT: ...
 
     def one(self) -> RowT:
         """Fetch a single row asynchronously."""
@@ -71,7 +69,7 @@ class AsyncResultSetWrapper(Generic[RowT]):
         query: Any,
         params: Any,
         initial_result_set: ResultSet,
-        **execute_kwargs
+        **execute_kwargs,
     ):
         """Initialize wrapper with session, query info, and initial ResultSet.
 
@@ -127,17 +125,16 @@ class AsyncResultSetWrapper(Generic[RowT]):
             # Preserve all kwargs from initial call (execution_profile, timeout, etc.)
             # but remove paging_state if present - we manage it internally
             paging_state = self._current_result_set.paging_state
-            fetch_kwargs = {k: v for k, v in self._execute_kwargs.items() if k != 'paging_state'}
+            fetch_kwargs = {
+                k: v for k, v in self._execute_kwargs.items() if k != "paging_state"
+            }
 
             # Use same logic as aexecute() to get ResultSet from execute_async
             from cassandra.cluster import ResultSet
             import asyncio
 
             future = self._session.execute_async(
-                self._query,
-                self._params,
-                paging_state=paging_state,
-                **fetch_kwargs
+                self._query, self._params, paging_state=paging_state, **fetch_kwargs
             )
 
             loop = asyncio.get_running_loop()
@@ -147,7 +144,9 @@ class AsyncResultSetWrapper(Generic[RowT]):
                 """Callback that wraps result in ResultSet."""
                 if not async_future.cancelled():
                     result_set = ResultSet(future, result)
-                    loop.call_soon_threadsafe(lambda: async_future.set_result(result_set))
+                    loop.call_soon_threadsafe(
+                        lambda: async_future.set_result(result_set)
+                    )
 
             def handle_error(exc):
                 """Errback that sets exception."""
@@ -169,7 +168,7 @@ class AsyncResultSetWrapper(Generic[RowT]):
             except StopIteration:
                 # Empty page (shouldn't happen, but handle gracefully)
                 raise StopAsyncIteration
-    
+
     def one(self) -> RowT:
         """Return a single row from the current page of results."""
         return self._current_result_set.one()  # type: ignore[no-any-return]

@@ -16,6 +16,7 @@ from chainlit_cassandra_data_layer.cass_util import AsyncResultSetWrapper, aexec
 
 class MockRow(NamedTuple):
     """Mock row type for testing."""
+
     id: uuid.UUID
     name: str
     value: int
@@ -41,9 +42,11 @@ class MockResponseFuture:
         self._callbacks = []
         self._errbacks = []
         # These attributes are needed for ResultSet construction
-        self._col_names = ['id', 'name', 'value']
+        self._col_names = ["id", "name", "value"]
         self._col_types = None
-        self._paging_state = f"page_{page_index}" if page_index < len(pages) - 1 else None
+        self._paging_state = (
+            f"page_{page_index}" if page_index < len(pages) - 1 else None
+        )
         self.has_more_pages = page_index < len(pages) - 1
 
     def add_callback(self, fn, *args, **kwargs):
@@ -55,8 +58,11 @@ class MockResponseFuture:
         self._callbacks.append((fn, args, kwargs))
         # Immediately trigger callback in async context
         import asyncio
+
         # Get current page rows (simulating row_factory output)
-        result = self._pages[self._page_index] if self._page_index < len(self._pages) else []
+        result = (
+            self._pages[self._page_index] if self._page_index < len(self._pages) else []
+        )
         # Schedule callback
         loop = asyncio.get_event_loop()
         loop.call_soon(lambda: fn(result, *args, **kwargs))
@@ -103,7 +109,7 @@ class MockSession:
             page_index = 0
         else:
             # Extract page index from paging_state
-            page_index = int(paging_state.split('_')[1]) + 1
+            page_index = int(paging_state.split("_")[1]) + 1
 
         # Return ResponseFuture for this page
         return MockResponseFuture(self._pages, page_index)
@@ -182,7 +188,7 @@ class TestAsyncResultSetWrapper:
         mock_session = MockSession([rows])
         wrapper = await aexecute(mock_session, "SELECT * FROM test")
 
-        assert wrapper.column_names == ['id', 'name', 'value']
+        assert wrapper.column_names == ["id", "name", "value"]
 
     async def test_has_more_pages_property(self):
         """Test that has_more_pages reflects pagination state."""
@@ -244,10 +250,7 @@ class TestAsyncResultSetWrapper:
             return result
 
         # Run both concurrently
-        results = await asyncio.gather(
-            collect_rows(wrapper1),
-            collect_rows(wrapper2)
-        )
+        results = await asyncio.gather(collect_rows(wrapper1), collect_rows(wrapper2))
 
         assert results[0] == rows1
         assert results[1] == rows2
@@ -261,9 +264,7 @@ class TestAsyncResultSetWrapper:
         test_params = (uuid.uuid4(), "test_value")
 
         wrapper = await aexecute(
-            mock_session,
-            "SELECT * FROM test WHERE id = %s AND name = %s",
-            test_params
+            mock_session, "SELECT * FROM test WHERE id = %s AND name = %s", test_params
         )
 
         result = []
@@ -292,10 +293,10 @@ class TestAsyncResultSetWrapper:
                 self._call_count += 1
 
                 # Determine page based on paging_state
-                if 'paging_state' not in kwargs or kwargs['paging_state'] is None:
+                if "paging_state" not in kwargs or kwargs["paging_state"] is None:
                     page_index = 0
                 else:
-                    page_index = int(kwargs['paging_state'].split('_')[1]) + 1
+                    page_index = int(kwargs["paging_state"].split("_")[1]) + 1
 
                 return MockResponseFuture(self._pages, page_index)
 
@@ -308,7 +309,7 @@ class TestAsyncResultSetWrapper:
             None,
             timeout=30,
             trace=True,
-            execution_profile="custom_profile"
+            execution_profile="custom_profile",
         )
 
         result = []
@@ -322,15 +323,15 @@ class TestAsyncResultSetWrapper:
         assert len(captured_kwargs) == 2  # Initial + pagination
 
         # Check initial call
-        assert captured_kwargs[0]['timeout'] == 30
-        assert captured_kwargs[0]['trace'] is True
-        assert captured_kwargs[0]['execution_profile'] == "custom_profile"
+        assert captured_kwargs[0]["timeout"] == 30
+        assert captured_kwargs[0]["trace"] is True
+        assert captured_kwargs[0]["execution_profile"] == "custom_profile"
 
         # Check pagination call - should have same kwargs plus paging_state
-        assert captured_kwargs[1]['timeout'] == 30
-        assert captured_kwargs[1]['trace'] is True
-        assert captured_kwargs[1]['execution_profile'] == "custom_profile"
-        assert 'paging_state' in captured_kwargs[1]
+        assert captured_kwargs[1]["timeout"] == 30
+        assert captured_kwargs[1]["trace"] is True
+        assert captured_kwargs[1]["execution_profile"] == "custom_profile"
+        assert "paging_state" in captured_kwargs[1]
 
     async def test_paging_state_not_overridden_by_kwargs(self):
         """Test that paging_state parameter takes precedence over execute_kwargs.
@@ -349,15 +350,15 @@ class TestAsyncResultSetWrapper:
 
             def execute_async(self, query, params=None, **kwargs):
                 # Track the paging_state that was actually used
-                captured_paging_states.append(kwargs.get('paging_state'))
+                captured_paging_states.append(kwargs.get("paging_state"))
 
                 # Determine page
-                paging_state = kwargs.get('paging_state')
+                paging_state = kwargs.get("paging_state")
                 if paging_state is None:
                     page_index = 0
-                elif paging_state.startswith('page_'):
+                elif paging_state.startswith("page_"):
                     # Our correct paging state format
-                    page_index = int(paging_state.split('_')[1]) + 1
+                    page_index = int(paging_state.split("_")[1]) + 1
                 else:
                     # Invalid/wrong paging state - just return first page
                     page_index = 0
@@ -371,7 +372,7 @@ class TestAsyncResultSetWrapper:
             mock_session,
             "SELECT * FROM test",
             None,
-            paging_state="wrong_state"  # This should be overridden during pagination
+            paging_state="wrong_state",  # This should be overridden during pagination
         )
 
         result = []
@@ -427,8 +428,14 @@ class TestAsyncResultSetWrapper:
         3. Return those to a caller (e.g., send to client)
         4. Later, use the paging_state to fetch the next page
         """
-        page1 = [MockRow(uuid.uuid4(), "Page1_Row1", 1), MockRow(uuid.uuid4(), "Page1_Row2", 2)]
-        page2 = [MockRow(uuid.uuid4(), "Page2_Row1", 3), MockRow(uuid.uuid4(), "Page2_Row2", 4)]
+        page1 = [
+            MockRow(uuid.uuid4(), "Page1_Row1", 1),
+            MockRow(uuid.uuid4(), "Page1_Row2", 2),
+        ]
+        page2 = [
+            MockRow(uuid.uuid4(), "Page2_Row1", 3),
+            MockRow(uuid.uuid4(), "Page2_Row2", 4),
+        ]
         page3 = [MockRow(uuid.uuid4(), "Page3_Row1", 5)]
 
         mock_session = MockSession([page1, page2, page3])
@@ -451,10 +458,7 @@ class TestAsyncResultSetWrapper:
 
         # Step 4: Later, client requests next page with the paging_state
         wrapper2 = await aexecute(
-            mock_session,
-            "SELECT * FROM test",
-            None,
-            paging_state=first_paging_state
+            mock_session, "SELECT * FROM test", None, paging_state=first_paging_state
         )
 
         # Extract second page data
@@ -469,10 +473,7 @@ class TestAsyncResultSetWrapper:
 
         # Step 5: Get third page
         wrapper3 = await aexecute(
-            mock_session,
-            "SELECT * FROM test",
-            None,
-            paging_state=second_paging_state
+            mock_session, "SELECT * FROM test", None, paging_state=second_paging_state
         )
 
         third_page_rows = wrapper3.current_rows
@@ -509,7 +510,9 @@ class TestAexecuteHelperFunction:
         mock_session = MockSession([rows])
         test_id = uuid.uuid4()
 
-        wrapper = await aexecute(mock_session, "SELECT * FROM test WHERE id = %s", (test_id,))
+        wrapper = await aexecute(
+            mock_session, "SELECT * FROM test WHERE id = %s", (test_id,)
+        )
 
         result = []
         async for row in wrapper:
@@ -565,11 +568,12 @@ class TestCassUtilIntegration:
             test_id = uuid.uuid4()
             session.execute(
                 "INSERT INTO test_data (id, name, value) VALUES (%s, %s, %s)",
-                (test_id, f"Row_{i}", i)
+                (test_id, f"Row_{i}", i),
             )
 
         # Create a prepared statement with small fetch_size to force pagination
         from cassandra.query import SimpleStatement
+
         query = SimpleStatement("SELECT * FROM test_data", fetch_size=5)
 
         # Use aexecute with the query
@@ -584,7 +588,9 @@ class TestCassUtilIntegration:
         # Verify session was called multiple times for pagination
         # (20 rows / 5 fetch_size = 4 pages)
 
-    async def test_resultset_properties_with_real_data(self, cassandra_integration_session):
+    async def test_resultset_properties_with_real_data(
+        self, cassandra_integration_session
+    ):
         """Test ResultSet properties with real Cassandra data."""
         session = cassandra_integration_session
 
@@ -593,19 +599,20 @@ class TestCassUtilIntegration:
             test_id = uuid.uuid4()
             session.execute(
                 "INSERT INTO test_data (id, name, value) VALUES (%s, %s, %s)",
-                (test_id, f"TestRow_{i}", i * 10)
+                (test_id, f"TestRow_{i}", i * 10),
             )
 
         # Query with small fetch_size
         from cassandra.query import SimpleStatement
+
         query = SimpleStatement("SELECT * FROM test_data", fetch_size=3)
 
         wrapper = await aexecute(session, query)
 
         # Verify column_names
-        assert 'id' in wrapper.column_names
-        assert 'name' in wrapper.column_names
-        assert 'value' in wrapper.column_names
+        assert "id" in wrapper.column_names
+        assert "name" in wrapper.column_names
+        assert "value" in wrapper.column_names
 
         # Verify has_more_pages is True initially (10 rows > 3 fetch_size)
         assert wrapper.has_more_pages is True
@@ -623,7 +630,9 @@ class TestCassUtilIntegration:
 
         assert len(result) == 10
 
-    async def test_empty_result_set_from_real_query(self, cassandra_integration_session):
+    async def test_empty_result_set_from_real_query(
+        self, cassandra_integration_session
+    ):
         """Test empty result set from real Cassandra query."""
         session = cassandra_integration_session
 
@@ -631,7 +640,7 @@ class TestCassUtilIntegration:
         wrapper = await aexecute(
             session,
             "SELECT * FROM test_data WHERE name = %s ALLOW FILTERING",
-            ("NonexistentName",)
+            ("NonexistentName",),
         )
 
         # Verify iteration over empty result set works
@@ -650,14 +659,12 @@ class TestCassUtilIntegration:
         test_id = uuid.uuid4()
         session.execute(
             "INSERT INTO test_data (id, name, value) VALUES (%s, %s, %s)",
-            (test_id, "SpecificName", 999)
+            (test_id, "SpecificName", 999),
         )
 
         # Query with parameters
         wrapper = await aexecute(
-            session,
-            "SELECT * FROM test_data WHERE id = %s",
-            (test_id,)
+            session, "SELECT * FROM test_data WHERE id = %s", (test_id,)
         )
 
         # Collect results

@@ -12,7 +12,17 @@ from chainlit.user import User
 import random
 import copy
 
-from chainlit_cassandra_data_layer.data import CollectThreadListResult, TimeBucketStrategy, smallest_uuid7_for_datetime, uuid7, BasicActivityBucketStrategy, collect_thread_list_results, uuid7_isoformat, ThreadCursor, uuid7_to_datetime
+from chainlit_cassandra_data_layer.data import (
+    CollectThreadListResult,
+    TimeBucketStrategy,
+    smallest_uuid7_for_datetime,
+    uuid7,
+    BasicActivityBucketStrategy,
+    collect_thread_list_results,
+    uuid7_isoformat,
+    ThreadCursor,
+    uuid7_to_datetime,
+)
 
 
 @pytest.mark.asyncio
@@ -66,7 +76,6 @@ def make_list_threads_results_asynciterable(
     bs: TimeBucketStrategy,
     all_rows: Sequence[Any],
 ) -> AsyncIterable[tuple[datetime, AsyncIterable[Any]]]:
-
     # Add clustring
     results_clustering = {}
     for row in all_rows:
@@ -78,7 +87,7 @@ def make_list_threads_results_asynciterable(
     # Sort clustering groups in desceinding order of thread_created_at
     for _, rows in results_clustering.items():
         rows.sort(key=lambda r: r.thread_created_at, reverse=True)
-    
+
     # Sort rows into their partitions
     results_partitioned = {}
     for clustering_bucket, rows in results_clustering.items():
@@ -87,21 +96,27 @@ def make_list_threads_results_asynciterable(
             results_partitioned.setdefault(partition_bucket, []).append(row)
 
     # Created tuples of (partition_bucket, rows) sorted by partition_bucket descending
-    sorted_by_partition = sorted(results_partitioned.items(), key=lambda x: x[0], reverse=True)
+    sorted_by_partition = sorted(
+        results_partitioned.items(), key=lambda x: x[0], reverse=True
+    )
 
     async def rows_gen(items: Sequence[Any]) -> AsyncIterable[Any]:
         items = sorted(items, key=lambda r: r.clustering_bucket_start, reverse=True)
         for item in items:
             yield item
-    
-    async def partition_gen(partitions: Sequence[tuple[datetime, Sequence[Any]]]) -> AsyncIterable[tuple[datetime, AsyncIterable[Any]]]:
+
+    async def partition_gen(
+        partitions: Sequence[tuple[datetime, Sequence[Any]]],
+    ) -> AsyncIterable[tuple[datetime, AsyncIterable[Any]]]:
         for timestamp, items in partitions:
             yield (timestamp, rows_gen(items))
 
     return partition_gen(sorted_by_partition)
 
 
-def build_threads_by_user_activity_rows_dataset(start_time: datetime) -> Sequence[Namespace]:
+def build_threads_by_user_activity_rows_dataset(
+    start_time: datetime,
+) -> Sequence[Namespace]:
     seed = 40
     rand = random.Random(seed)
 
@@ -118,14 +133,17 @@ def build_threads_by_user_activity_rows_dataset(start_time: datetime) -> Sequenc
                     activity_at=uuid7(datetime=current),
                     thread_id=thread_id,
                     thread_name=f"thread-{str(thread_id)[:8]}",
-                    thread_created_at=uuid7(datetime=current - timedelta(minutes=rand.randint(0, 7*24*60)))
+                    thread_created_at=uuid7(
+                        datetime=current
+                        - timedelta(minutes=rand.randint(0, 7 * 24 * 60))
+                    ),
                 )
             )
         )
     return data
 
 
-def partition_by[T, R](items: Sequence[T], key:Callable[[T], R]) -> Sequence[T]:
+def partition_by[T, R](items: Sequence[T], key: Callable[[T], R]) -> Sequence[T]:
     partitions = {}
     for item in items:
         value = key(item)
@@ -134,18 +152,24 @@ def partition_by[T, R](items: Sequence[T], key:Callable[[T], R]) -> Sequence[T]:
 
 
 def dump_results(results: CollectThreadListResult):
-    groups = partition_by(results.selected_rows, key=lambda r: r.clustering_bucket_start)
+    groups = partition_by(
+        results.selected_rows, key=lambda r: r.clustering_bucket_start
+    )
     for group in groups:
         print(group[0].clustering_bucket_start)
         dump_rows(group)
         print()
     if results.next_cursor is not None:
-        print(f"next start: {results.next_cursor['start']}, thread_start: {uuid7_isoformat(results.next_cursor.get('thread_start')) if results.next_cursor.get('thread_start') else 'None'}")
+        print(
+            f"next start: {results.next_cursor['start']}, thread_start: {uuid7_isoformat(results.next_cursor.get('thread_start')) if results.next_cursor.get('thread_start') else 'None'}"
+        )
 
 
 def dump_rows(rows: Sequence[Namespace]):
     for row in rows:
-        print(f"{uuid7_isoformat(row.activity_at)}, Created At: {uuid7_isoformat(row.thread_created_at)}")
+        print(
+            f"{uuid7_isoformat(row.activity_at)}, Created At: {uuid7_isoformat(row.thread_created_at)}"
+        )
 
 
 @pytest.mark.asyncio
@@ -154,21 +178,15 @@ class TestListThreadsLogic:
         # Get basic dataset of rows
         start_time = datetime(2024, 1, 1, tzinfo=UTC)
         data = build_threads_by_user_activity_rows_dataset(start_time)
-        
+
         # Organize rows int async iterable for consumption by collect_thread_list_results
         bs = BasicActivityBucketStrategy(
             timedelta(days=60), timedelta(days=10), start_time=start_time
         )
-        async_iterable = make_list_threads_results_asynciterable(
-            bs,
-            data
-        )
+        async_iterable = make_list_threads_results_asynciterable(bs, data)
 
         pagination = Pagination(first=5)
-        result = await collect_thread_list_results(
-            pagination,
-            async_iterable
-        )
+        result = await collect_thread_list_results(pagination, async_iterable)
 
         # Did we we get 5 rows?
         assert len(result.selected_rows) == pagination.first, "Got wrong number of rows"
@@ -179,11 +197,13 @@ class TestListThreadsLogic:
             if last_activity_at is not None:
                 assert row.activity_at < last_activity_at
             last_activity_at = row.activity_at
-        
+
         data_sorted = sorted(data, key=lambda r: r.activity_at, reverse=True)
 
         # Do the thread_ids match the expected ones?
-        assert set(row.thread_id for row in result.selected_rows) == set(data_sorted[i].thread_id for i in range(5))
+        assert set(row.thread_id for row in result.selected_rows) == set(
+            data_sorted[i].thread_id for i in range(5)
+        )
 
     async def test_pagination_cursor_mid_clustering(self):
         # Get basic dataset of rows
@@ -194,24 +214,21 @@ class TestListThreadsLogic:
         bs = BasicActivityBucketStrategy(
             timedelta(days=60), timedelta(days=10), start_time=start_time
         )
-        async_iterable = make_list_threads_results_asynciterable(
-            bs,
-            data
-        )
+        async_iterable = make_list_threads_results_asynciterable(bs, data)
 
         # Find cursor start position in the middle of a clustering group
         sorted_data = sorted(data, key=lambda r: r.activity_at, reverse=True)
         print(f"Total rows: {len(sorted_data)}")
         second_partition_rows = partition_by(
-            sorted_data,
-            key=lambda r: r.partition_bucket_start
+            sorted_data, key=lambda r: r.partition_bucket_start
         )[1]
         second_clustering_group_rows = partition_by(
-            second_partition_rows,
-            key=lambda r: r.clustering_bucket_start
+            second_partition_rows, key=lambda r: r.clustering_bucket_start
         )[1]
         mid_index = len(second_clustering_group_rows) // 2
-        second_clustering_group_rows = sorted(second_clustering_group_rows, key=lambda r: r.activity_at, reverse=True)
+        second_clustering_group_rows = sorted(
+            second_clustering_group_rows, key=lambda r: r.activity_at, reverse=True
+        )
         cursor_row = second_clustering_group_rows[mid_index]
         cursor_start = cursor_row.activity_at
         cursor = ThreadCursor(start=cursor_start)
@@ -220,15 +237,15 @@ class TestListThreadsLogic:
         # Test that a cursor in the middle of a clustering group is handled correctly
         pagination = Pagination(first=page_size)
         result = await collect_thread_list_results(
-            pagination,
-            async_iterable,
-            cursor=cursor
+            pagination, async_iterable, cursor=cursor
         )
-        
+
         # Everything should have an activity_at less than or equal to the cursor
         for row in result.selected_rows:
-            assert row.activity_at <= cursor["start"], "Row activity_at is greater than cursor"
-        
+            assert row.activity_at <= cursor["start"], (
+                "Row activity_at is greater than cursor"
+            )
+
         # Did we we get the right number of rows?
         assert len(result.selected_rows) == pagination.first, "Got wrong number of rows"
 
@@ -238,21 +255,21 @@ class TestListThreadsLogic:
             if last_activity_at is not None:
                 assert row.activity_at < last_activity_at
             last_activity_at = row.activity_at
-        
-        # Did we get the expected rows?
-        expected = [
-            r for r in sorted_data
-            if r.activity_at <= cursor["start"]
-        ][:pagination.first]
 
-        assert set(row.thread_id for row in result.selected_rows) == set(r.thread_id for r in expected)
+        # Did we get the expected rows?
+        expected = [r for r in sorted_data if r.activity_at <= cursor["start"]][
+            : pagination.first
+        ]
+
+        assert set(row.thread_id for row in result.selected_rows) == set(
+            r.thread_id for r in expected
+        )
 
         # Are all remaining rows either greater than start or lessthan or equal
         # to the next cursor start?
         row_ids_returned = set(row.thread_id for row in result.selected_rows)
         rows_not_included = [
-            r for r in sorted_data
-            if r.thread_id not in row_ids_returned
+            r for r in sorted_data if r.thread_id not in row_ids_returned
         ]
         if result.next_cursor is not None:
             for row in rows_not_included:
@@ -262,7 +279,9 @@ class TestListThreadsLogic:
                 ), "Row activity_at is not in expected range"
         else:
             for row in rows_not_included:
-                assert row.activity_at > cursor["start"], "Row activity_at is not greater than cursor"
+                assert row.activity_at > cursor["start"], (
+                    "Row activity_at is not greater than cursor"
+                )
 
     async def test_cluster_larger_than_expected(self):
         # Get basic dataset of rows
@@ -273,17 +292,11 @@ class TestListThreadsLogic:
         bs = BasicActivityBucketStrategy(
             timedelta(days=60), timedelta(days=10), start_time=start_time
         )
-        async_iterable = make_list_threads_results_asynciterable(
-            bs,
-            data
-        )
+        async_iterable = make_list_threads_results_asynciterable(bs, data)
 
         # Ensure we have to stop processing a group prematurely
         sorted_data = sorted(data, key=lambda r: r.activity_at, reverse=True)
-        data_groups = partition_by(
-            sorted_data,
-            key=lambda r: r.clustering_bucket_start
-        )
+        data_groups = partition_by(sorted_data, key=lambda r: r.clustering_bucket_start)
         first_group_size = len(data_groups[0])
         second_group_size = len(data_groups[1])
         page_size = int(first_group_size + second_group_size // 2)
@@ -292,45 +305,61 @@ class TestListThreadsLogic:
 
         # Get the results
         result = await collect_thread_list_results(
-            pagination,
-            async_iterable,
-            max_clustering_size=max_clustering_size
+            pagination, async_iterable, max_clustering_size=max_clustering_size
         )
 
         # Only results from group 1 and 2
         expected_clustering_buckets = {
             data_groups[0][0].clustering_bucket_start,
-            data_groups[1][0].clustering_bucket_start
+            data_groups[1][0].clustering_bucket_start,
         }
         result_clustering_buckets = {
             row.clustering_bucket_start for row in result.selected_rows
         }
-        assert expected_clustering_buckets == result_clustering_buckets, "Got unexpected clustering buckets"
+        assert expected_clustering_buckets == result_clustering_buckets, (
+            "Got unexpected clustering buckets"
+        )
 
         # thread_ids collected
         collected_ids = set(row.thread_id for row in result.selected_rows)
 
         # Did we we get the right number of rows?
         assert len(result.selected_rows) == pagination.first, "Got wrong number of rows"
-        
+
         # Did we get a cursor?
         assert result.next_cursor is not None, "Expected a next cursor but got None"
-        
+
         # Does the cursor include a thread_start?
-        assert result.next_cursor.get("thread_start") is not None, "Expected cursor to have a thread_start"
+        assert result.next_cursor.get("thread_start") is not None, (
+            "Expected cursor to have a thread_start"
+        )
 
         # Do results contain all of group 1?
         expected_group_1 = {r.thread_id for r in data_groups[0]}
-        assert expected_group_1.issubset(collected_ids), "Did not collect all expected rows from clustering group 1"
+        assert expected_group_1.issubset(collected_ids), (
+            "Did not collect all expected rows from clustering group 1"
+        )
 
         # Of the rows from group 2, did we include all the ones with
         # thread_created_at greater than the thread_start?
-        expected_group_2 = {r.thread_id for r in data_groups[1] if r.thread_created_at > result.next_cursor["thread_start"]}
-        assert expected_group_2.issubset(collected_ids), "Did not collect all expected rows from clustering group 2"
+        expected_group_2 = {
+            r.thread_id
+            for r in data_groups[1]
+            if r.thread_created_at > result.next_cursor["thread_start"]
+        }
+        assert expected_group_2.issubset(collected_ids), (
+            "Did not collect all expected rows from clustering group 2"
+        )
 
         # Did we exclude all group 2 rows with thread_created_at less than or equal to thread_start?
-        excluded_group_2 = {r.thread_id for r in data_groups[1] if r.thread_created_at <= result.next_cursor["thread_start"]}
-        assert collected_ids.isdisjoint(excluded_group_2), "Collected rows that should have been excluded from clustering group 2"
+        excluded_group_2 = {
+            r.thread_id
+            for r in data_groups[1]
+            if r.thread_created_at <= result.next_cursor["thread_start"]
+        }
+        assert collected_ids.isdisjoint(excluded_group_2), (
+            "Collected rows that should have been excluded from clustering group 2"
+        )
 
         # Were results in descending order of activity_at?
         last_activity_at = None
@@ -338,7 +367,7 @@ class TestListThreadsLogic:
             if last_activity_at is not None:
                 assert row.activity_at < last_activity_at
             last_activity_at = row.activity_at
-    
+
     async def test_page_size_larger_than_available_data(self):
         # Get dataset of 10 rows
         start_time = datetime(2024, 1, 1, tzinfo=UTC)
@@ -348,19 +377,13 @@ class TestListThreadsLogic:
         bs = BasicActivityBucketStrategy(
             timedelta(days=60), timedelta(days=10), start_time=start_time
         )
-        async_iterable = make_list_threads_results_asynciterable(
-            bs,
-            data
-        )
+        async_iterable = make_list_threads_results_asynciterable(bs, data)
 
         # Set the page size to be larger than the dataset
         pagination = Pagination(first=20)
 
         # Get the results
-        result = await collect_thread_list_results(
-            pagination,
-            async_iterable
-        )
+        result = await collect_thread_list_results(pagination, async_iterable)
 
         # Did we get all the rows?
         assert len(result.selected_rows) == len(data), "Did not get all available rows"
@@ -376,19 +399,13 @@ class TestListThreadsLogic:
         bs = BasicActivityBucketStrategy(
             timedelta(days=60), timedelta(days=10), start_time=start_time
         )
-        async_iterable = make_list_threads_results_asynciterable(
-            bs,
-            data
-        )
+        async_iterable = make_list_threads_results_asynciterable(bs, data)
 
         # Set the page size to be equal to the dataset size
         pagination = Pagination(first=len(data))
 
         # Get the results
-        result = await collect_thread_list_results(
-            pagination,
-            async_iterable
-        )
+        result = await collect_thread_list_results(pagination, async_iterable)
 
         # Did we get all the rows?
         assert len(result.selected_rows) == len(data), "Did not get all available rows"
@@ -406,10 +423,14 @@ class TestListThreadsLogic:
         # Get dataset of 10 rows
         data = build_threads_by_user_activity_rows_dataset(start_time)
         data_sorted = sorted(data, key=lambda r: r.activity_at, reverse=True)
-        data_by_clustering = partition_by(data_sorted, key=lambda r: bs.get_bucket(r.activity_at)[1])
+        data_by_clustering = partition_by(
+            data_sorted, key=lambda r: bs.get_bucket(r.activity_at)[1]
+        )
 
         # Let's duplicate some rows
-        activities_to_duplicate = rand.sample(data_by_clustering[0]+data_by_clustering[1], k=10)
+        activities_to_duplicate = rand.sample(
+            data_by_clustering[0] + data_by_clustering[1], k=10
+        )
         # and duplicate some duplicates
         activities_to_duplicate += rand.choices(activities_to_duplicate, k=2)
 
@@ -429,25 +450,21 @@ class TestListThreadsLogic:
             data.append(activity)
 
         # Organize rows into async iterable for consumption by collect_thread_list_results
-        async_iterable = make_list_threads_results_asynciterable(
-            bs,
-            data
-        )
+        async_iterable = make_list_threads_results_asynciterable(bs, data)
         # Set the page size
         page_size = 200
         pagination = Pagination(first=page_size)
         # Get the results
-        result = await collect_thread_list_results(
-            pagination,
-            async_iterable
-        )
+        result = await collect_thread_list_results(pagination, async_iterable)
 
         # Were there any duplicates?
         seen_thread_ids = set()
         for row in result.selected_rows:
-            assert row.thread_id not in seen_thread_ids, "Found duplicate thread_id in results"
+            assert row.thread_id not in seen_thread_ids, (
+                "Found duplicate thread_id in results"
+            )
             seen_thread_ids.add(row.thread_id)
-        
+
         # Did we get the right number of rows?
         assert len(result.selected_rows) == page_size, "Got wrong number of rows"
 
@@ -458,21 +475,18 @@ class TestListThreadsLogic:
         bs = BasicActivityBucketStrategy(
             timedelta(days=60), timedelta(days=10), start_time=start_time
         )
-        async_iterable = make_list_threads_results_asynciterable(
-            bs,
-            data
-        )
+        async_iterable = make_list_threads_results_asynciterable(bs, data)
         name_to_search_for = data[-5].thread_name
         filters = ThreadFilter(search=name_to_search_for)
         result = await collect_thread_list_results(
-            Pagination(first=10),
-            async_iterable,
-            filters=filters
+            Pagination(first=10), async_iterable, filters=filters
         )
 
         # Did we get only matching rows?
         for row in result.selected_rows:
-            assert name_to_search_for.lower() in (row.thread_name or "").lower(), "Got non-matching row"
+            assert name_to_search_for.lower() in (row.thread_name or "").lower(), (
+                "Got non-matching row"
+            )
 
         # Did we get exactly 1 result?
         assert len(result.selected_rows) == 1, "Expected exactly 1 matching row"
@@ -1024,8 +1038,8 @@ class TestThreadOperations:
                 old_timestamp = dt.now() - timedelta(hours=1 + j)
                 old_activity_uuid = smallest_uuid7_for_datetime(old_timestamp)
                 created_at_uuid = smallest_uuid7_for_datetime(dt.now())
-                partition_bucket, clustering_bucket = data_layer.activity_bucket_strategy.get_bucket(
-                    old_timestamp
+                partition_bucket, clustering_bucket = (
+                    data_layer.activity_bucket_strategy.get_bucket(old_timestamp)
                 )
 
                 insert_query = f"""
