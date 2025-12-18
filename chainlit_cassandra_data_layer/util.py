@@ -42,10 +42,10 @@ async def dedupe_iterable(
         yield item
 
 
-async def afilter(
-    predicate: Callable[[Any], bool],
-    async_iterable: AsyncIterable[Any],
-) -> AsyncIterator[Any]:
+async def afilter[T](
+    predicate: Callable[[T], bool],
+    async_iterable: AsyncIterable[T],
+) -> AsyncIterator[T]:
     async for item in async_iterable:
         if predicate(item):
             yield item
