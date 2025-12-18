@@ -1,19 +1,27 @@
-from typing import Any, AsyncIterable, AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
+from typing import Any
 
 
-async def amap[T, R](func: Callable[[T], R], items: AsyncIterable[T]) -> AsyncIterator[R]:
-            async for item in items:
-                yield func(item)
-        
-async def achain_from[T](iterables: AsyncIterable[AsyncIterable[T]]) -> AsyncIterator[T]:
+async def amap[T, R](
+    func: Callable[[T], R], items: AsyncIterable[T]
+) -> AsyncIterator[R]:
+    async for item in items:
+        yield func(item)
+
+
+async def achain_from[T](
+    iterables: AsyncIterable[AsyncIterable[T]],
+) -> AsyncIterator[T]:
     async for iterable in iterables:
         async for item in iterable:
             yield item
+
 
 async def achain[T](*iterables: AsyncIterable[T]) -> AsyncIterator[T]:
     for iterable in iterables:
         async for item in iterable:
             yield item
+
 
 async def apushback[T](item: T, async_iterable: AsyncIterable[T]) -> AsyncIterator[T]:
     yield item

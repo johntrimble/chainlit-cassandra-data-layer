@@ -375,7 +375,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "aiosqlite" },
-    { name = "cassandra-asyncio-driver" },
     { name = "cassandra-driver" },
     { name = "cqlsh" },
     { name = "hypothesis" },
@@ -400,7 +399,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
-    { name = "cassandra-asyncio-driver", specifier = ">=0.1.4" },
     { name = "cassandra-driver", specifier = ">=3.29.2" },
     { name = "cqlsh" },
     { name = "hypothesis", specifier = ">=6.140.3" },

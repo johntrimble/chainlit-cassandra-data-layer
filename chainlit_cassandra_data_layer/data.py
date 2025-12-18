@@ -3,7 +3,6 @@ import json
 import logging
 import uuid
 from collections.abc import (
-    AsyncIterable,
     AsyncIterator,
     Collection,
     Sequence,
@@ -43,7 +42,15 @@ from chainlit.user import PersistedUser, User
 
 from chainlit_cassandra_data_layer.cass_util import AsyncResultSet, aexecute
 from chainlit_cassandra_data_layer.migration import MigrationManager
-from chainlit_cassandra_data_layer.util import achain, achain_from, aempty, afilter, amap, apushback, dedupe_iterable
+from chainlit_cassandra_data_layer.util import (
+    achain,
+    achain_from,
+    aempty,
+    afilter,
+    amap,
+    apushback,
+    dedupe_iterable,
+)
 
 # Import for runtime usage (isinstance checks)
 try:
@@ -341,7 +348,8 @@ class CollectThreadListResult:
 
 
 async def consume_next_clustering_bucket(
-    row_iterator: AsyncIterator[Any], max_rows: int = 1_000,
+    row_iterator: AsyncIterator[Any],
+    max_rows: int = 1_000,
 ) -> tuple[list[Any], AsyncIterator[Any] | None, bool]:
     """Consume rows from the iterator until the clustering bucket changes.
 
@@ -360,12 +368,12 @@ async def consume_next_clustering_bucket(
         if row.clustering_bucket_start != current_clustering_bucket:
             row_iterator = apushback(row, row_iterator)
             return (bucket_rows, row_iterator, True)
-        
+
         # We exceeded our budget for this bucket, so return early
         if len(bucket_rows) >= max_rows:
             row_iterator = apushback(row, row_iterator)
             return (bucket_rows, row_iterator, False)
-        
+
         bucket_rows.append(row)
 
     # Iterator exhausted
@@ -379,7 +387,6 @@ async def collect_thread_list_results(
     max_clustering_size: int = 1_000,
     search: str | None = None,
 ) -> CollectThreadListResult:
-
     # Get rid of any duplicates the iterator might return and track them
     duplicate_rows: list[Any] = []
     row_iterator = dedupe_iterable(
@@ -421,8 +428,13 @@ async def collect_thread_list_results(
         needed_to_fill_page = page_size - len(collected)
         max_rows = max(needed_to_fill_page, max_clustering_size)
 
-        bucket_rows, current_iterator, completed_bucket = await consume_next_clustering_bucket(
-            current_iterator, max_rows=max_rows,
+        (
+            bucket_rows,
+            current_iterator,
+            completed_bucket,
+        ) = await consume_next_clustering_bucket(
+            current_iterator,
+            max_rows=max_rows,
         )
 
         # This will simplify some uses of anext() below
@@ -439,9 +451,7 @@ async def collect_thread_list_results(
         # see rows that are more recent than our start cursor. Drop all such
         # rows.
         if not first_bucket or thread_start is None:
-            bucket_rows = [
-                row for row in bucket_rows if row.activity_at <= start
-            ]
+            bucket_rows = [row for row in bucket_rows if row.activity_at <= start]
         first_bucket = False
 
         if completed_bucket:
@@ -2100,7 +2110,7 @@ class CassandraDataLayer(BaseDataLayer):
         start: uuid.UUID = uuid7(datetime=datetime.now(tz=UTC))
         if cursor_dict and cursor_dict.get("start"):
             start = cursor_dict["start"]
-        
+
         thread_start: uuid.UUID = uuid7(datetime=add_timezone_if_missing(datetime.max))
         if cursor_dict and cursor_dict.get("thread_start"):
             thread_start = cursor_dict["thread_start"]
@@ -2108,7 +2118,7 @@ class CassandraDataLayer(BaseDataLayer):
         # Figure out how many items to fetch
         page_size = pagination.first if pagination.first else DEFAULT_THREADS_PER_PAGE
 
-        # Get 20% extra to account for duplicate results and consuming entire 
+        # Get 20% extra to account for duplicate results and consuming entire
         # clustering buckets
         fetch_size = int(page_size * 1.20)
 
@@ -2147,8 +2157,8 @@ class CassandraDataLayer(BaseDataLayer):
             # Previously, we were unable to fully consume a clustering bucket
             # and had to stop in the middle. Now we are resuming from that point
             # so the first clustering bucket needs to be handled specially.
-            partition_bucket_start, clustering_bucket_start = self.activity_bucket_strategy.get_bucket(
-                start
+            partition_bucket_start, clustering_bucket_start = (
+                self.activity_bucket_strategy.get_bucket(start)
             )
             first_iterator = self._row_iterator_prepared(
                 select_threads_with_thread_start_query,
@@ -2163,8 +2173,12 @@ class CassandraDataLayer(BaseDataLayer):
 
             # After the first clustering bucket, the remaining can be handled
             # normally
-            next_partition_bucket_start, _ = self.activity_bucket_strategy.get_bucket(clustering_bucket_start - timedelta(milliseconds=1))
-            partitions = self._find_partitions_for_user_descending(user_id, next_partition_bucket_start)
+            next_partition_bucket_start, _ = self.activity_bucket_strategy.get_bucket(
+                clustering_bucket_start - timedelta(milliseconds=1)
+            )
+            partitions = self._find_partitions_for_user_descending(
+                user_id, next_partition_bucket_start
+            )
             row_iterator = achain_from(
                 amap(
                     lambda partition: self._row_iterator_prepared(
@@ -2192,7 +2206,9 @@ class CassandraDataLayer(BaseDataLayer):
                     ),
                     fetch_size=fetch_size,
                 ),
-                self._find_partitions_for_user_descending(user_id, uuid7_to_datetime(start)),
+                self._find_partitions_for_user_descending(
+                    user_id, uuid7_to_datetime(start)
+                ),
             )
 
             row_iterator = achain_from(iterators)

@@ -88,11 +88,9 @@ def make_list_threads_results_asynciterable(
     # Sort clustering groups in desceinding order of thread_created_at
     for _, rows in results_clustering.items():
         rows.sort(key=lambda r: r.thread_created_at, reverse=True)
-    
+
     sorted_rows = []
-    sorted_buckets = sorted(
-        results_clustering.keys(), reverse=True
-    )
+    sorted_buckets = sorted(results_clustering.keys(), reverse=True)
     for bucket in sorted_buckets:
         sorted_rows.extend(results_clustering[bucket])
 
@@ -117,17 +115,14 @@ def build_threads_by_user_activity_rows_dataset(
         current += delta
         thread_id = uuid.uuid4()
         data.append(
-            
-                Namespace(
-                    activity_at=uuid7(datetime=current),
-                    thread_id=thread_id,
-                    thread_name=f"thread-{str(thread_id)[:8]}",
-                    thread_created_at=uuid7(
-                        datetime=current
-                        - timedelta(minutes=rand.randint(0, 7 * 24 * 60))
-                    ),
-                )
-            
+            Namespace(
+                activity_at=uuid7(datetime=current),
+                thread_id=thread_id,
+                thread_name=f"thread-{str(thread_id)[:8]}",
+                thread_created_at=uuid7(
+                    datetime=current - timedelta(minutes=rand.randint(0, 7 * 24 * 60))
+                ),
+            )
         )
     return data
 
@@ -149,8 +144,10 @@ def dump_results(results: CollectThreadListResult):
         dump_rows(group)
         print()
     if results.next_cursor is not None:
-        thread_start = results.next_cursor.get('thread_start')
-        thread_start_str = uuid7_isoformat(thread_start) if thread_start is not None else 'None'
+        thread_start = results.next_cursor.get("thread_start")
+        thread_start_str = (
+            uuid7_isoformat(thread_start) if thread_start is not None else "None"
+        )
         print(
             f"next start: {results.next_cursor['start']}, thread_start: {thread_start_str}"
         )
@@ -247,7 +244,7 @@ class TestListThreadsLogic:
 
         # Did we get the expected rows?
         expected = [r for r in sorted_data if r.activity_at <= cursor["start"]][
-            : page_size
+            :page_size
         ]
 
         assert set(row.thread_id for row in result.selected_rows) == set(
