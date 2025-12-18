@@ -76,7 +76,7 @@ class TestUserOperations:
 def make_list_threads_results_asynciterable(
     bs: TimeBucketStrategy,
     all_rows: Sequence[Any],
-) -> AsyncIterable[tuple[datetime, AsyncIterable[Any]]]:
+) -> AsyncIterable[Any]:
     # Add clustring
     results_clustering = {}
     for row in all_rows:
@@ -88,31 +88,19 @@ def make_list_threads_results_asynciterable(
     # Sort clustering groups in desceinding order of thread_created_at
     for _, rows in results_clustering.items():
         rows.sort(key=lambda r: r.thread_created_at, reverse=True)
-
-    # Sort rows into their partitions
-    results_partitioned = {}
-    for _, rows in results_clustering.items():
-        for row in rows:
-            partition_bucket = row.partition_bucket_start
-            results_partitioned.setdefault(partition_bucket, []).append(row)
-
-    # Created tuples of (partition_bucket, rows) sorted by partition_bucket descending
-    sorted_by_partition = sorted(
-        results_partitioned.items(), key=lambda x: x[0], reverse=True
+    
+    sorted_rows = []
+    sorted_buckets = sorted(
+        results_clustering.keys(), reverse=True
     )
+    for bucket in sorted_buckets:
+        sorted_rows.extend(results_clustering[bucket])
 
-    async def rows_gen(items: Sequence[Any]) -> AsyncIterable[Any]:
-        items = sorted(items, key=lambda r: r.clustering_bucket_start, reverse=True)
-        for item in items:
-            yield item
+    async def row_gen() -> AsyncIterable[Any]:
+        for row in sorted_rows:
+            yield row
 
-    async def partition_gen(
-        partitions: Sequence[tuple[datetime, Sequence[Any]]],
-    ) -> AsyncIterable[tuple[datetime, AsyncIterable[Any]]]:
-        for timestamp, items in partitions:
-            yield (timestamp, rows_gen(items))
-
-    return partition_gen(sorted_by_partition)
+    return row_gen()
 
 
 def build_threads_by_user_activity_rows_dataset(
@@ -186,11 +174,11 @@ class TestListThreadsLogic:
         )
         async_iterable = make_list_threads_results_asynciterable(bs, data)
 
-        pagination = Pagination(first=5)
-        result = await collect_thread_list_results(pagination, async_iterable)
+        page_size = 5
+        result = await collect_thread_list_results(async_iterable, page_size=page_size)
 
         # Did we we get 5 rows?
-        assert len(result.selected_rows) == pagination.first, "Got wrong number of rows"
+        assert len(result.selected_rows) == page_size, "Got wrong number of rows"
 
         # Were they in descending order of activity_at?
         last_activity_at = None
@@ -219,7 +207,6 @@ class TestListThreadsLogic:
 
         # Find cursor start position in the middle of a clustering group
         sorted_data = sorted(data, key=lambda r: r.activity_at, reverse=True)
-        print(f"Total rows: {len(sorted_data)}")
         second_partition_rows = partition_by(
             sorted_data, key=lambda r: r.partition_bucket_start
         )[1]
@@ -236,10 +223,12 @@ class TestListThreadsLogic:
         page_size = int(len(second_clustering_group_rows) * 1.5)
 
         # Test that a cursor in the middle of a clustering group is handled correctly
-        pagination = Pagination(first=page_size)
         result = await collect_thread_list_results(
-            pagination, async_iterable, cursor=cursor
+            async_iterable, cursor=cursor, page_size=page_size
         )
+
+        print("Cursor start:", uuid7_isoformat(cursor_start))
+        dump_rows(result.selected_rows)
 
         # Everything should have an activity_at less than or equal to the cursor
         for row in result.selected_rows:
@@ -248,7 +237,7 @@ class TestListThreadsLogic:
             )
 
         # Did we we get the right number of rows?
-        assert len(result.selected_rows) == pagination.first, "Got wrong number of rows"
+        assert len(result.selected_rows) == page_size, "Got wrong number of rows"
 
         # Were they in descending order of activity_at?
         last_activity_at = None
@@ -259,7 +248,7 @@ class TestListThreadsLogic:
 
         # Did we get the expected rows?
         expected = [r for r in sorted_data if r.activity_at <= cursor["start"]][
-            : pagination.first
+            : page_size
         ]
 
         assert set(row.thread_id for row in result.selected_rows) == set(
@@ -302,11 +291,10 @@ class TestListThreadsLogic:
         second_group_size = len(data_groups[1])
         page_size = int(first_group_size + second_group_size // 2)
         max_clustering_size = second_group_size // 2
-        pagination = Pagination(first=page_size)
 
         # Get the results
         result = await collect_thread_list_results(
-            pagination, async_iterable, max_clustering_size=max_clustering_size
+            async_iterable, max_clustering_size=max_clustering_size, page_size=page_size
         )
 
         # Only results from group 1 and 2
@@ -317,6 +305,10 @@ class TestListThreadsLogic:
         result_clustering_buckets = {
             row.clustering_bucket_start for row in result.selected_rows
         }
+        print("Expected clustering buckets:", expected_clustering_buckets)
+        print("Result clustering buckets:", result_clustering_buckets)
+        print("Page size:", page_size)
+        print("Rows returned:", len(result.selected_rows))
         assert expected_clustering_buckets == result_clustering_buckets, (
             "Got unexpected clustering buckets"
         )
@@ -325,7 +317,7 @@ class TestListThreadsLogic:
         collected_ids = set(row.thread_id for row in result.selected_rows)
 
         # Did we we get the right number of rows?
-        assert len(result.selected_rows) == pagination.first, "Got wrong number of rows"
+        assert len(result.selected_rows) == page_size, "Got wrong number of rows"
 
         # Did we get a cursor?
         assert result.next_cursor is not None, "Expected a next cursor but got None"
@@ -381,10 +373,10 @@ class TestListThreadsLogic:
         async_iterable = make_list_threads_results_asynciterable(bs, data)
 
         # Set the page size to be larger than the dataset
-        pagination = Pagination(first=20)
+        page_size = 20
 
         # Get the results
-        result = await collect_thread_list_results(pagination, async_iterable)
+        result = await collect_thread_list_results(async_iterable, page_size=page_size)
 
         # Did we get all the rows?
         assert len(result.selected_rows) == len(data), "Did not get all available rows"
@@ -403,10 +395,10 @@ class TestListThreadsLogic:
         async_iterable = make_list_threads_results_asynciterable(bs, data)
 
         # Set the page size to be equal to the dataset size
-        pagination = Pagination(first=len(data))
+        page_size = len(data)
 
         # Get the results
-        result = await collect_thread_list_results(pagination, async_iterable)
+        result = await collect_thread_list_results(async_iterable, page_size=page_size)
 
         # Did we get all the rows?
         assert len(result.selected_rows) == len(data), "Did not get all available rows"
@@ -454,9 +446,8 @@ class TestListThreadsLogic:
         async_iterable = make_list_threads_results_asynciterable(bs, data)
         # Set the page size
         page_size = 200
-        pagination = Pagination(first=page_size)
         # Get the results
-        result = await collect_thread_list_results(pagination, async_iterable)
+        result = await collect_thread_list_results(async_iterable, page_size=page_size)
 
         # Were there any duplicates?
         seen_thread_ids = set()
@@ -478,9 +469,9 @@ class TestListThreadsLogic:
         )
         async_iterable = make_list_threads_results_asynciterable(bs, data)
         name_to_search_for = data[-5].thread_name
-        filters = ThreadFilter(search=name_to_search_for)
+        page_size = 10
         result = await collect_thread_list_results(
-            Pagination(first=10), async_iterable, filters=filters
+            async_iterable, page_size=page_size, search=name_to_search_for
         )
 
         # Did we get only matching rows?

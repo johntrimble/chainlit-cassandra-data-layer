@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import (
     Any,
+    Callable,
     NotRequired,
     TypedDict,
     cast,
@@ -43,6 +44,7 @@ from chainlit.user import PersistedUser, User
 
 from chainlit_cassandra_data_layer.cass_util import AsyncResultSet, aexecute
 from chainlit_cassandra_data_layer.migration import MigrationManager
+from chainlit_cassandra_data_layer.util import achain, achain_from, aempty, afilter, amap, apushback, dedupe_iterable
 
 # Import for runtime usage (isinstance checks)
 try:
@@ -327,17 +329,6 @@ class BasicActivityBucketStrategy(TimeBucketStrategy):
         return (partition_bucket, clustering_bucket)
 
 
-# def list_buckets_desc(
-#     strategy: TimeBucketStrategy,
-#     start: datetime,
-#     end: datetime,
-# ):
-#     if end > start:
-#         start, end = end, start
-
-#     partition_bucket, clustering_bucket = strategy.get_bucket(start)
-
-
 class ThreadCursor(TypedDict):
     start: uuid.UUID
     thread_start: NotRequired[uuid.UUID]
@@ -350,12 +341,162 @@ class CollectThreadListResult:
     duplicate_rows: Sequence[Any] | None = None
 
 
+async def consume_next_clustering_bucket(
+    row_iterator: AsyncIterator[Any], max_rows: int = 1_000,
+) -> tuple[list[Any], AsyncIterator[Any] | None, bool]:
+    """Consume rows from the iterator until the clustering bucket changes.
+
+    Returns when the clustering bucket changes or the iterator is exhausted.
+    """
+    first_row = True
+    current_clustering_bucket = None
+    bucket_rows = []
+
+    async for row in row_iterator:
+        if first_row:
+            current_clustering_bucket = row.clustering_bucket_start
+            first_row = False
+
+        # Clustering bucket changed, return the bucket contents
+        if row.clustering_bucket_start != current_clustering_bucket:
+            row_iterator = apushback(row, row_iterator)
+            return (bucket_rows, row_iterator, True)
+        
+        # We exceeded our budget for this bucket, so return early
+        if len(bucket_rows) >= max_rows:
+            row_iterator = apushback(row, row_iterator)
+            return (bucket_rows, row_iterator, False)
+        
+        bucket_rows.append(row)
+
+
+    # Iterator exhausted
+    return (bucket_rows, None, True)
+
+
 async def collect_thread_list_results(
-    pagination: Pagination,
+    row_iterator: AsyncIterable[Any],
+    cursor: ThreadCursor | None = None,
+    page_size: int | None = None,
+    max_clustering_size: int = 1_000,
+    search: str | None = None,
+) -> CollectThreadListResult:
+
+    # Get rid of any duplicates the iterator might return and track them
+    duplicate_rows = []
+    row_iterator = dedupe_iterable(
+        row_iterator, key_func=lambda r: r.thread_id, duplicates=duplicate_rows
+    )
+
+    if search is not None:
+        row_iterator = afilter(
+            lambda r: search.lower() in (r.thread_name or "").lower(),
+            row_iterator,
+        )
+
+    start: uuid.UUID
+    if cursor and cursor.get("start"):
+        start = cursor["start"]
+    else:
+        # Make largest possible UUID
+        start = uuid.UUID("ffffffff-ffff-7fff-bfff-ffffffffffff")
+
+    thread_start: uuid.UUID | None = cursor.get("thread_start") if cursor else None
+
+    empty_iter = aempty()
+
+    collected = []
+    first_bucket = True
+    while row_iterator is not None and row_iterator is not empty_iter:
+        # If we accumulate a full page of results _and_ exhaust max_clustering_size,
+        # that's when we return early. Set max_rows accordingly.
+        needed_to_fill_page = page_size - len(collected)
+        max_rows = max(needed_to_fill_page, max_clustering_size)
+
+        bucket_rows, row_iterator, completed_bucket = await consume_next_clustering_bucket(
+            row_iterator, max_rows=max_rows,
+        )
+
+        # This will simplify some uses of anext() below
+        if row_iterator is None:
+            row_iterator = empty_iter
+
+        # Remove prefix of rows that are more recent than our cursor
+        if first_bucket and thread_start is not None:
+            while bucket_rows and bucket_rows[0].thread_created_at <= thread_start:
+                bucket_rows.pop(0)
+
+        if thread_start is None:
+            bucket_rows = [
+                row for row in bucket_rows if row.activity_at <= start
+            ]
+        first_bucket = False
+
+        if completed_bucket:
+            bucket_rows.sort(key=lambda r: r.activity_at, reverse=True)
+            collected.extend(bucket_rows)
+            if len(collected) >= page_size:
+                # We have enough results for the page, but we need the next row
+                # for the cursor
+                next_row = None
+                if len(collected) > page_size:
+                    next_row = collected[page_size]
+                else:
+                    next_row = await anext(row_iterator, None)
+
+                next_cursor = None
+                if next_row is not None:
+                    next_cursor = {
+                        "start": next_row.activity_at,
+                    }
+                return CollectThreadListResult(
+                    duplicate_rows=duplicate_rows,
+                    selected_rows=collected[:page_size],
+                    next_cursor=next_cursor,
+                )
+        else:
+            # We did not complete the bucket, so we do have enough results for the
+            # page, but we do need to return a special cursor to continue from here
+            number_to_add = page_size - len(collected)
+            rows_to_add = bucket_rows[:number_to_add]
+            collected.extend(
+                sorted(rows_to_add, key=lambda r: r.activity_at, reverse=True)
+            )
+
+            # Need to find the next row to construct the cursor
+            next_row = None
+            if number_to_add < len(bucket_rows):
+                next_row = bucket_rows[number_to_add]
+            else:
+                # We need to get one more row from the iterator
+                next_row = await anext(row_iterator, None)
+            
+            next_cursor = None
+            if next_row is not None:
+                next_cursor = {
+                    "start": next_row.clustering_bucket_start,
+                    "thread_start": next_row.thread_created_at,
+                }
+            return CollectThreadListResult(
+                duplicate_rows=duplicate_rows,
+                selected_rows=collected,
+                next_cursor=next_cursor,
+            )
+
+    # Exhausted iterator without filling the page
+    return CollectThreadListResult(
+        duplicate_rows=duplicate_rows,
+        selected_rows=collected,
+        next_cursor=None,
+    )
+
+
+async def _collect_thread_list_results(
     list_threads_results: AsyncIterable[tuple[datetime, AsyncIterable[Any]]],
     cursor: ThreadCursor | None = None,
+    page_size: int | None = None,
     max_clustering_size: int = 1_000,
-    filters: ThreadFilter | None = None,
+    search: str | None = None,
 ) -> CollectThreadListResult:
     start: uuid.UUID
     if cursor and cursor.get("start"):
@@ -392,9 +533,8 @@ async def collect_thread_list_results(
             self.seen_threads.add(row.thread_id)
 
             # Skip rows that don't match the filter
-            if filters is not None:
-                search_str = (filters.search or "").lower()
-                if search_str not in (row.thread_name or "").lower():
+            if search is not None:
+                if search.lower() not in (row.thread_name or "").lower():
                     return False
 
             starting_from_middle_of_clustering_group = (
@@ -477,31 +617,35 @@ async def collect_thread_list_results(
             return False
 
     rp = RowProcessor(
-        page_size=pagination.first, max_clustering_size=max_clustering_size
+        page_size=page_size, max_clustering_size=max_clustering_size
     )
     should_stop = False
+    partition_group = None
     cluster_group = None
-    async for partition_start, rs in list_threads_results:
-        should_stop = rp.start_partition(partition_start) or should_stop
-        any_rows = False
-        async for row in rs:
-            any_rows = True
-            if cluster_group != row.clustering_bucket_start:
-                if cluster_group is not None:
-                    should_stop = rp.end_cluster() or should_stop
-                should_stop = (
-                    rp.start_cluster(row.clustering_bucket_start) or should_stop
-                )
-                cluster_group = row.clustering_bucket_start
-            should_stop = rp.handle_row(row) or should_stop
-            if should_stop:
-                break
-        if any_rows:
-            should_stop = rp.end_cluster() or should_stop
-            cluster_group = None
-        should_stop = rp.end_partition() or should_stop
+    async for row in list_threads_results:
+        if row.partition_bucket_start != partition_group:
+            if partition_group is not None:
+                should_stop = rp.end_partition() or should_stop
+            should_stop = (
+                rp.start_partition(row.partition_bucket_start) or should_stop
+            )
+            partition_group = row.partition_bucket_start
+        if cluster_group != row.clustering_bucket_start:
+            if cluster_group is not None:
+                should_stop = rp.end_cluster() or should_stop
+            should_stop = (
+                rp.start_cluster(row.clustering_bucket_start) or should_stop
+            )
+            cluster_group = row.clustering_bucket_start
+        
+        should_stop = rp.handle_row(row) or should_stop
         if should_stop:
             break
+
+    if cluster_group is not None:
+        should_stop = rp.end_cluster() or should_stop
+    if partition_group is not None:
+        should_stop = rp.end_partition() or should_stop
 
     return CollectThreadListResult(
         duplicate_rows=rp.duplicate_rows,
@@ -625,6 +769,20 @@ class CassandraDataLayer(BaseDataLayer):
         """Add a prepared statement with parameters to a batch."""
         statement = self._get_prepared_statement(query)
         batch.add(statement, parameters)
+
+    async def _row_iterator_prepared(
+        self,
+        query: str,
+        params: tuple[Any, ...],
+        fetch_size: int,
+    ) -> AsyncIterator[Any]:
+        rs = await self._aexecute_prepared(
+            query,
+            params,
+            fetch_size=fetch_size,
+        )
+        async for row in rs:
+            yield row
 
     def _to_utc_datetime(self, dt: datetime) -> datetime:
         """Convert a naive datetime (assumed UTC) to timezone-aware UTC datetime.
@@ -2074,13 +2232,13 @@ class CassandraDataLayer(BaseDataLayer):
         if pagination.cursor:
             cursor_dict = self.decode_thread_cursor(pagination.cursor)
 
-        thread_start: uuid.UUID = uuid7(datetime=add_timezone_if_missing(datetime.max))
-        if cursor_dict and cursor_dict.get("thread_start"):
-            thread_start = cursor_dict["thread_start"]
-
         start: uuid.UUID = uuid7(datetime=datetime.now(tz=UTC))
         if cursor_dict and cursor_dict.get("start"):
             start = cursor_dict["start"]
+        
+        thread_start: uuid.UUID = uuid7(datetime=add_timezone_if_missing(datetime.max))
+        if cursor_dict and cursor_dict.get("thread_start"):
+            thread_start = cursor_dict["thread_start"]
 
         # Figure out how many items to fetch
         page_size = pagination.first if pagination.first else MAX_THREADS_PER_PAGE
@@ -2095,7 +2253,7 @@ class CassandraDataLayer(BaseDataLayer):
         user_id = to_uuid(filters.userId)
 
         select_threads_query = f"""
-        SELECT clustering_bucket_start, thread_id, thread_name, thread_created_at, activity_at
+        SELECT partition_bucket_start,clustering_bucket_start, thread_id, thread_name, thread_created_at, activity_at
         FROM {self._table_threads_by_user_activity}
         WHERE user_id = %s AND partition_bucket_start = %s
         AND clustering_bucket_start < %s
@@ -2105,68 +2263,74 @@ class CassandraDataLayer(BaseDataLayer):
         # additional condition to the query to only get threads before that ID
         # in the first clustering bucket.
         select_threads_with_thread_start_query = f"""
-        SELECT clustering_bucket_start, thread_id, thread_name, thread_created_at, activity_at
+        SELECT partition_bucket_start, clustering_bucket_start, thread_id, thread_name, thread_created_at, activity_at
         FROM {self._table_threads_by_user_activity}
         WHERE user_id = %s AND partition_bucket_start = %s
         AND clustering_bucket_start = %s AND thread_id < %s
         """
 
-        async def results_gen():
-            async for partition in self._find_partitions_for_user_descending(
-                user_id, start
-            ):
-                _, clustering_bucket_start = self.activity_bucket_strategy.get_bucket(
-                    start
-                )
-                if cursor_dict and "thread_start" in cursor_dict:
+        # Build the row iterator
+        if cursor_dict and "thread_start" in cursor_dict:
+            # Edge case
+            #
+            # Previously, we were unable to fully consume a clustering bucket
+            # and had to stop in the middle. Now we are resuming from that point
+            # so the first clustering bucket needs to be handled specially.
+            partition_bucket_start, clustering_bucket_start = self.activity_bucket_strategy.get_bucket(
+                start
+            )
+            first_iterator = self._row_iterator_prepared(
+                select_threads_with_thread_start_query,
+                (
+                    user_id,
+                    partition_bucket_start,
+                    clustering_bucket_start,
+                    thread_start,
+                ),
+                fetch_size=fetch_size,
+            )
 
-                    async def join(partition=partition):
-                        _, clustering_bucket_start = (
-                            self.activity_bucket_strategy.get_bucket(start)
-                        )
-                        rs = await self._aexecute_prepared(
-                            select_threads_with_thread_start_query,
-                            (
-                                user_id,
-                                partition,
-                                clustering_bucket_start,
-                                thread_start,
-                            ),
-                            fetch_size=fetch_size,
-                        )
-                        async for row in rs:
-                            yield row
-                        # Now fetch the rest of the partition normally
-                        rs2 = await self._aexecute_prepared(
-                            select_threads_query,
-                            (
-                                user_id,
-                                partition,
-                                clustering_bucket_start,
-                            ),
-                            fetch_size=fetch_size,
-                        )
-                        async for row in rs2:
-                            yield row
-
-                    yield partition, join()
-                else:
-                    rs = await self._aexecute_prepared(
+            # After the first clustering bucket, the remaining can be handled
+            # normally
+            next_partition_bucket_start, _ = self.activity_bucket_strategy.get_bucket(clustering_bucket_start - timedelta(milliseconds=1))
+            partitions = self._find_partitions_for_user_descending(user_id, next_partition_bucket_start)
+            row_iterator = achain_from(
+                amap(
+                    lambda partition: self._row_iterator_prepared(
                         select_threads_query,
                         (
                             user_id,
                             partition,
-                            clustering_bucket_start + timedelta(milliseconds=1),
+                            clustering_bucket_start,
                         ),
                         fetch_size=fetch_size,
-                    )
-                    yield partition, rs
+                    ),
+                    partitions,
+                )
+            )
+            row_iterator = achain(first_iterator, row_iterator)
+        else:
+            # Normal case
+            iterators: AsyncIterator[AsyncIterator[Any]] = amap(
+                lambda partition: self._row_iterator_prepared(
+                    select_threads_query,
+                    (
+                        user_id,
+                        partition,
+                        uuid7_to_datetime(start),
+                    ),
+                    fetch_size=fetch_size,
+                ),
+                self._find_partitions_for_user_descending(user_id, start),
+            )
+
+            row_iterator = achain_from(iterators)
 
         result = await collect_thread_list_results(
-            pagination,
-            results_gen(),
+            row_iterator,
             cursor_dict,
-            filters=filters,
+            page_size=page_size,
+            search=filters.search if filters else None
         )
 
         # Cleanup any duplicates we found
