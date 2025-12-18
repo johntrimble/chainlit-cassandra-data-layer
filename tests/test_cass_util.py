@@ -38,8 +38,8 @@ class MockResponseFuture:
         """
         self._pages = pages
         self._page_index = page_index
-        self._callbacks = []
-        self._errbacks = []
+        self._callbacks: list = []
+        self._errbacks: list = []
         # These attributes are needed for ResultSet construction
         self._col_names = ["id", "name", "value"]
         self._col_types = None

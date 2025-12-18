@@ -23,7 +23,7 @@ async def apushback[T](item: T, async_iterable: AsyncIterable[T]) -> AsyncIterat
 
 async def dedupe_iterable(
     iterator: AsyncIterable[Any], key_func: Callable[[Any], Any], duplicates
-):
+) -> AsyncIterator[Any]:
     seen_keys = set()
     async for item in iterator:
         key = key_func(item)

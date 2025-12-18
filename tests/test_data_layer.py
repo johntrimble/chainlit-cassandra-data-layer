@@ -78,7 +78,7 @@ def make_list_threads_results_asynciterable(
     all_rows: Sequence[Any],
 ) -> AsyncIterable[Any]:
     # Add clustring
-    results_clustering = {}
+    results_clustering: dict = {}
     for row in all_rows:
         partition_bucket, clustering_bucket = bs.get_bucket(row.activity_at)
         row.partition_bucket_start = partition_bucket
@@ -133,7 +133,7 @@ def build_threads_by_user_activity_rows_dataset(
 
 
 def partition_by[T, R](items: Sequence[T], key: Callable[[T], R]) -> Sequence[T]:
-    partitions = {}
+    partitions: dict = {}
     for item in items:
         value = key(item)
         partitions.setdefault(value, []).append(item)
@@ -149,8 +149,10 @@ def dump_results(results: CollectThreadListResult):
         dump_rows(group)
         print()
     if results.next_cursor is not None:
+        thread_start = results.next_cursor.get('thread_start')
+        thread_start_str = uuid7_isoformat(thread_start) if thread_start is not None else 'None'
         print(
-            f"next start: {results.next_cursor['start']}, thread_start: {uuid7_isoformat(results.next_cursor.get('thread_start')) if results.next_cursor.get('thread_start') else 'None'}"
+            f"next start: {results.next_cursor['start']}, thread_start: {thread_start_str}"
         )
 
 
@@ -227,9 +229,6 @@ class TestListThreadsLogic:
             async_iterable, cursor=cursor, page_size=page_size
         )
 
-        print("Cursor start:", uuid7_isoformat(cursor_start))
-        dump_rows(result.selected_rows)
-
         # Everything should have an activity_at less than or equal to the cursor
         for row in result.selected_rows:
             assert row.activity_at <= cursor["start"], (
@@ -305,10 +304,7 @@ class TestListThreadsLogic:
         result_clustering_buckets = {
             row.clustering_bucket_start for row in result.selected_rows
         }
-        print("Expected clustering buckets:", expected_clustering_buckets)
-        print("Result clustering buckets:", result_clustering_buckets)
-        print("Page size:", page_size)
-        print("Rows returned:", len(result.selected_rows))
+
         assert expected_clustering_buckets == result_clustering_buckets, (
             "Got unexpected clustering buckets"
         )

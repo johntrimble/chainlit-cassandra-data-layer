@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import (
     Any,
-    Callable,
     NotRequired,
     TypedDict,
     cast,
@@ -350,7 +349,7 @@ async def consume_next_clustering_bucket(
     """
     first_row = True
     current_clustering_bucket = None
-    bucket_rows = []
+    bucket_rows: list[Any] = []
 
     async for row in row_iterator:
         if first_row:
@@ -374,15 +373,15 @@ async def consume_next_clustering_bucket(
 
 
 async def collect_thread_list_results(
-    row_iterator: AsyncIterable[Any],
+    row_iterator: AsyncIterator[Any],
+    page_size: int,
     cursor: ThreadCursor | None = None,
-    page_size: int | None = None,
     max_clustering_size: int = 1_000,
     search: str | None = None,
 ) -> CollectThreadListResult:
 
     # Get rid of any duplicates the iterator might return and track them
-    duplicate_rows = []
+    duplicate_rows: list[Any] = []
     row_iterator = dedupe_iterable(
         row_iterator, key_func=lambda r: r.thread_id, duplicates=duplicate_rows
     )
@@ -394,6 +393,8 @@ async def collect_thread_list_results(
             row_iterator,
         )
 
+    # start indicates the activity_at UUID at which we want to start collecting
+    # rows (inclusive). Rows with activity_at > start are skipped.
     start: uuid.UUID
     if cursor and cursor.get("start"):
         start = cursor["start"]
@@ -401,25 +402,32 @@ async def collect_thread_list_results(
         # Make largest possible UUID
         start = uuid.UUID("ffffffff-ffff-7fff-bfff-ffffffffffff")
 
+    # thread_start is used when a page was completed without reading the entire
+    # clustering bucket. In that case, the first bucket we read from now should
+    # only include rows with thread_created_at <= thread_start.
     thread_start: uuid.UUID | None = cursor.get("thread_start") if cursor else None
 
-    empty_iter = aempty()
+    empty_iter: AsyncIterator[Any] = aempty()
 
-    collected = []
+    collected: list[Any] = []
     first_bucket = True
-    while row_iterator is not None and row_iterator is not empty_iter:
+
+    # Track the current iterator which may be None or AsyncIterator
+    current_iterator: AsyncIterator[Any] | None = row_iterator
+
+    while current_iterator is not None and current_iterator is not empty_iter:
         # If we accumulate a full page of results _and_ exhaust max_clustering_size,
         # that's when we return early. Set max_rows accordingly.
         needed_to_fill_page = page_size - len(collected)
         max_rows = max(needed_to_fill_page, max_clustering_size)
 
-        bucket_rows, row_iterator, completed_bucket = await consume_next_clustering_bucket(
-            row_iterator, max_rows=max_rows,
+        bucket_rows, current_iterator, completed_bucket = await consume_next_clustering_bucket(
+            current_iterator, max_rows=max_rows,
         )
 
         # This will simplify some uses of anext() below
-        if row_iterator is None:
-            row_iterator = empty_iter
+        if current_iterator is None:
+            current_iterator = empty_iter
 
         # Remove prefix of rows that are more recent than our cursor
         if first_bucket and thread_start is not None:
@@ -446,9 +454,9 @@ async def collect_thread_list_results(
                 if len(collected) > page_size:
                     next_row = collected[page_size]
                 else:
-                    next_row = await anext(row_iterator, None)
+                    next_row = await anext(current_iterator, None)
 
-                next_cursor = None
+                next_cursor: ThreadCursor | None = None
                 if next_row is not None:
                     next_cursor = {
                         "start": next_row.activity_at,
@@ -473,8 +481,8 @@ async def collect_thread_list_results(
                 next_row = bucket_rows[number_to_add]
             else:
                 # We need to get one more row from the iterator
-                next_row = await anext(row_iterator, None)
-            
+                next_row = await anext(current_iterator, None)
+
             next_cursor = None
             if next_row is not None:
                 next_cursor = {
@@ -522,6 +530,17 @@ class CassandraDataLayer(BaseDataLayer):
             default_consistency_level: Optional consistency level override. When
                 omitted, the value from the session's default execution profile is
                 used.
+            activity_bucket_strategy: Strategy for bucketing thread activity by time.
+                If not provided, defaults to `BasicActivityBucketStrategy` with
+                60-day partitions and 10-day clustering buckets. Controls how thread
+                activity data is distributed across Cassandra partitions for efficient
+                querying.
+            max_clustering_bucket_size: Number of rows to scan from a clustering
+                bucket before potentially returning a page of results. This value
+                should be larger than the typical number of rows in a clustering
+                bucket. Defaults to 1000.
+            log: Optional logger instance for data layer operations. If not provided,
+                a logger named after this module will be created.
         """
         self.session: Session = session
         self.cluster = session.cluster
@@ -2173,15 +2192,15 @@ class CassandraDataLayer(BaseDataLayer):
                     ),
                     fetch_size=fetch_size,
                 ),
-                self._find_partitions_for_user_descending(user_id, start),
+                self._find_partitions_for_user_descending(user_id, uuid7_to_datetime(start)),
             )
 
             row_iterator = achain_from(iterators)
 
         result = await collect_thread_list_results(
             row_iterator,
-            cursor_dict,
             page_size=page_size,
+            cursor=cursor_dict,
             search=filters.search if filters else None,
             max_clustering_size=self.max_clustering_bucket_size,
         )
@@ -2216,7 +2235,7 @@ class CassandraDataLayer(BaseDataLayer):
                 metadata=None,
                 steps=[],  # Empty array - UI will call get_thread when needed
                 elements=[],  # Empty array
-                # Optional fields default to None when not available from index query
+                # Optional fields default to None
             )
             threads.append(thread_dict)
 
