@@ -55,7 +55,7 @@ except ImportError:
 
 # Maximum number of threads to retrieve per page
 # This prevents excessive memory usage and ensures reasonable query performance
-MAX_THREADS_PER_PAGE = 50
+DEFAULT_THREADS_PER_PAGE = 200
 
 
 def first_exc(items: Collection) -> Exception | None:
@@ -369,7 +369,6 @@ async def consume_next_clustering_bucket(
         
         bucket_rows.append(row)
 
-
     # Iterator exhausted
     return (bucket_rows, None, True)
 
@@ -388,6 +387,7 @@ async def collect_thread_list_results(
         row_iterator, key_func=lambda r: r.thread_id, duplicates=duplicate_rows
     )
 
+    # Apply search filter
     if search is not None:
         row_iterator = afilter(
             lambda r: search.lower() in (r.thread_name or "").lower(),
@@ -426,7 +426,11 @@ async def collect_thread_list_results(
             while bucket_rows and bucket_rows[0].thread_created_at <= thread_start:
                 bucket_rows.pop(0)
 
-        if thread_start is None:
+        # Even if we were able to read a full clustering bucket on the previous
+        # page, we may not have returned all the results from it yet, so we may
+        # see rows that are more recent than our start cursor. Drop all such
+        # rows.
+        if not first_bucket or thread_start is None:
             bucket_rows = [
                 row for row in bucket_rows if row.activity_at <= start
             ]
@@ -491,169 +495,6 @@ async def collect_thread_list_results(
     )
 
 
-async def _collect_thread_list_results(
-    list_threads_results: AsyncIterable[tuple[datetime, AsyncIterable[Any]]],
-    cursor: ThreadCursor | None = None,
-    page_size: int | None = None,
-    max_clustering_size: int = 1_000,
-    search: str | None = None,
-) -> CollectThreadListResult:
-    start: uuid.UUID
-    if cursor and cursor.get("start"):
-        start = cursor["start"]
-    else:
-        # Make largest possible UUID
-        start = uuid.UUID("ffffffff-ffff-7fff-bfff-ffffffffffff")
-
-    thread_start: uuid.UUID | None = cursor.get("thread_start") if cursor else None
-
-    class RowProcessor:
-        def __init__(self, page_size: int = 100, max_clustering_size: int = 1000):
-            self.collected: list[Any] = []
-            self.group: list[Any] = []
-            self.page_size = page_size
-            self.next_cursor: ThreadCursor | None = None
-            self.max_clustering_size = max_clustering_size
-            self.clustering_index = 0
-            self.cursor_thread_created_at = None
-            self.stopped_in_middle_of_group = False
-            self.seen_threads: set[Any] = set()
-            self.duplicate_rows: list[Any] = []
-
-        def cycle_group(self):
-            self.group.sort(key=lambda r: r.activity_at, reverse=True)
-            self.collected.extend(self.group)
-            self.group = []
-
-        def handle_row(self, row: Any) -> bool:
-            # Skip duplicate threads
-            if row.thread_id in self.seen_threads:
-                self.duplicate_rows.append(row)
-                return False
-            self.seen_threads.add(row.thread_id)
-
-            # Skip rows that don't match the filter
-            if search is not None:
-                if search.lower() not in (row.thread_name or "").lower():
-                    return False
-
-            starting_from_middle_of_clustering_group = (
-                thread_start is not None and self.clustering_index == 0
-            )
-            if starting_from_middle_of_clustering_group:
-                # We are in the first clustering group and have a thread_start
-                # to respect. Only include rows with created_at <= thread_start.
-                if row.thread_created_at <= thread_start:
-                    self.group.append(row)
-            elif row.activity_at <= start:
-                self.group.append(row)
-
-            # This is an edge case where the previous cluster perfectly filled
-            # out the page of results, but we still needed to process one more
-            # row so that we could determine if we needed a next cursor.
-            if len(self.collected) == self.page_size:
-                return True
-
-            have_full_page_of_results = (
-                len(self.collected) + len(self.group) > self.page_size
-            )
-            over_max_clustering_size = len(self.group) > self.max_clustering_size
-
-            if have_full_page_of_results and over_max_clustering_size:
-                # There are too many rows for this clustering group for us to
-                # read them all. Instead we stop here and return a cursor to
-                # this position in the data. This means we will not get perfect
-                # activity ordering, but it prevents us from pulling down an
-                # arbitrary amount of data.
-                self.stopped_in_middle_of_group = True
-                return True
-            return False
-
-        def start_partition(self, dt: datetime) -> bool:
-            return False
-
-        def start_cluster(self, dt: datetime) -> bool:
-            # Make sure we reset the group in end_cluster
-            assert self.group == []
-            return False
-
-        def end_partition(self) -> bool:
-            return False
-
-        def end_cluster(self) -> bool:
-            self.clustering_index += 1
-            current_group = self.group
-            current_group_sorted = sorted(
-                current_group, key=lambda r: r.activity_at, reverse=True
-            )
-            self.group = []
-            current_size = len(self.collected) + len(current_group)
-
-            if current_size > self.page_size and not self.stopped_in_middle_of_group:
-                number_to_add = self.page_size - len(self.collected)
-                self.collected.extend(current_group_sorted[:number_to_add])
-                next_row = current_group_sorted[number_to_add]
-                self.next_cursor = {
-                    "start": next_row.activity_at,
-                }
-            elif current_size > self.page_size and self.stopped_in_middle_of_group:
-                number_to_add = self.page_size - len(self.collected)
-                self.collected.extend(
-                    sorted(
-                        current_group[:number_to_add],
-                        key=lambda r: r.activity_at,
-                        reverse=True,
-                    )
-                )
-                next_row = current_group[number_to_add]
-                self.next_cursor = {
-                    "start": next_row.clustering_bucket_start,
-                    "thread_start": next_row.thread_created_at,
-                }
-            else:
-                # Adding this group will not put us over the page size
-                self.collected.extend(current_group_sorted)
-
-            return False
-
-    rp = RowProcessor(
-        page_size=page_size, max_clustering_size=max_clustering_size
-    )
-    should_stop = False
-    partition_group = None
-    cluster_group = None
-    async for row in list_threads_results:
-        if row.partition_bucket_start != partition_group:
-            if partition_group is not None:
-                should_stop = rp.end_partition() or should_stop
-            should_stop = (
-                rp.start_partition(row.partition_bucket_start) or should_stop
-            )
-            partition_group = row.partition_bucket_start
-        if cluster_group != row.clustering_bucket_start:
-            if cluster_group is not None:
-                should_stop = rp.end_cluster() or should_stop
-            should_stop = (
-                rp.start_cluster(row.clustering_bucket_start) or should_stop
-            )
-            cluster_group = row.clustering_bucket_start
-        
-        should_stop = rp.handle_row(row) or should_stop
-        if should_stop:
-            break
-
-    if cluster_group is not None:
-        should_stop = rp.end_cluster() or should_stop
-    if partition_group is not None:
-        should_stop = rp.end_partition() or should_stop
-
-    return CollectThreadListResult(
-        duplicate_rows=rp.duplicate_rows,
-        selected_rows=rp.collected,
-        next_cursor=rp.next_cursor,
-    )
-
-
 class CassandraDataLayer(BaseDataLayer):
     """Cassandra-backed data layer for Chainlit."""
 
@@ -665,6 +506,7 @@ class CassandraDataLayer(BaseDataLayer):
         keyspace: str | None = None,
         default_consistency_level: int | None = None,
         activity_bucket_strategy: TimeBucketStrategy | None = None,
+        max_clustering_bucket_size: int = 1_000,
         log: logging.Logger | None = None,
     ):
         """Initialize the Cassandra data layer.
@@ -697,6 +539,10 @@ class CassandraDataLayer(BaseDataLayer):
                 clustering_bucket_size=timedelta(days=10),
             )
         self.activity_bucket_strategy = activity_bucket_strategy
+
+        # Save the max clustering bucket size. This is used to limit how many
+        # rows of a bucket we will scan before returning a page of results.
+        self.max_clustering_bucket_size = max_clustering_bucket_size
 
         # Determine the consistency level
         ep = session.cluster.profile_manager.profiles[EXEC_PROFILE_DEFAULT]
@@ -2241,16 +2087,22 @@ class CassandraDataLayer(BaseDataLayer):
             thread_start = cursor_dict["thread_start"]
 
         # Figure out how many items to fetch
-        page_size = pagination.first if pagination.first else MAX_THREADS_PER_PAGE
-        # Get 20% extra to account for duplicate results and consuming entire clustering buckets
+        page_size = pagination.first if pagination.first else DEFAULT_THREADS_PER_PAGE
+
+        # Get 20% extra to account for duplicate results and consuming entire 
+        # clustering buckets
         fetch_size = int(page_size * 1.20)
+
         # If filtering with a search string, double the fetch size again as most
         # results will be filtered out
         if filters.search:
-            fetch_size = min(fetch_size * 2, MAX_THREADS_PER_PAGE)
+            fetch_size = min(fetch_size * 2, DEFAULT_THREADS_PER_PAGE)
 
         # Get the user ID as a UUID to include in the query
         user_id = to_uuid(filters.userId)
+        if not user_id:
+            # User ID is required
+            raise ValueError(f"Invalid userId: {filters.userId}")
 
         select_threads_query = f"""
         SELECT partition_bucket_start,clustering_bucket_start, thread_id, thread_name, thread_created_at, activity_at
@@ -2330,7 +2182,8 @@ class CassandraDataLayer(BaseDataLayer):
             row_iterator,
             cursor_dict,
             page_size=page_size,
-            search=filters.search if filters else None
+            search=filters.search if filters else None,
+            max_clustering_size=self.max_clustering_bucket_size,
         )
 
         # Cleanup any duplicates we found
