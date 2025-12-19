@@ -13,7 +13,8 @@ statements = [
     identifier TEXT,
     created_at UUID,
     metadata BLOB
-  );
+  )
+  WITH COMPACTION = { 'class': 'UnifiedCompactionStrategy' };
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.users_by_identifier (
@@ -21,7 +22,8 @@ statements = [
     id UUID,
     created_at UUID,
     metadata BLOB
-  );
+  )
+  WITH COMPACTION = { 'class': 'UnifiedCompactionStrategy' };
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.threads (
@@ -33,7 +35,8 @@ statements = [
     metadata BLOB,
     tags LIST<TEXT>,
     deleted_at UUID
-  );
+  )
+  WITH COMPACTION = { 'class': 'UnifiedCompactionStrategy' };
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.steps (
@@ -42,6 +45,7 @@ statements = [
     created_at UUID,
     deleted_at UUID
   )
+  WITH COMPACTION = { 'class': 'UnifiedCompactionStrategy' };
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.steps_by_thread_id (
@@ -67,7 +71,8 @@ statements = [
     feedback_value INT,
     feedback_comment TEXT,
     PRIMARY KEY (thread_id, id)
-  );
+  )
+  WITH COMPACTION = { 'class': 'UnifiedCompactionStrategy' };
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.elements_by_thread_id (
@@ -86,7 +91,8 @@ statements = [
     props TEXT,
     created_at TIMESTAMP,
     PRIMARY KEY (thread_id, id)
-  );
+  )
+  WITH COMPACTION = { 'class': 'UnifiedCompactionStrategy' };
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.threads_by_user_activity (
@@ -98,7 +104,12 @@ statements = [
     thread_id UUID,
     thread_name TEXT,
     PRIMARY KEY ((user_id, partition_bucket_start), clustering_bucket_start, thread_created_at)
-  ) WITH CLUSTERING ORDER BY (clustering_bucket_start DESC, thread_created_at DESC);
+  )
+  WITH CLUSTERING ORDER BY (clustering_bucket_start DESC, thread_created_at DESC)
+  AND COMPACTION = {
+    'class': 'UnifiedCompactionStrategy', 
+    'scaling_parameters': 'L10'
+  };
   """,
   """
   CREATE TABLE IF NOT EXISTS ${keyspace}.user_activity_by_thread (
@@ -108,7 +119,9 @@ statements = [
     user_id UUID STATIC,
     thread_name TEXT STATIC,
     thread_created_at UUID STATIC,      -- uuidv7 timestamp
-    PRIMARY KEY (thread_id, clustering_bucket_start)
-  ) WITH CLUSTERING ORDER BY (clustering_bucket_start DESC);
+    PRIMARY KEY (thread_id, clustering_bucket_start, activity_at)
+  )
+  WITH CLUSTERING ORDER BY (clustering_bucket_start DESC)
+  AND COMPACTION = { 'class': 'UnifiedCompactionStrategy' };
   """,
 ]
