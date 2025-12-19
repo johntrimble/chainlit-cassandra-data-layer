@@ -23,7 +23,7 @@ import uuid_utils
 import uuid_utils.compat
 from cassandra.cluster import EXEC_PROFILE_DEFAULT, PreparedStatement, Session
 from cassandra.query import BatchStatement, BatchType
-from chainlit.context import context, ChainlitContextException
+from chainlit.context import ChainlitContextException, context
 from chainlit.data.base import BaseDataLayer
 from chainlit.data.storage_clients.base import BaseStorageClient
 from chainlit.data.utils import queue_until_user_message
@@ -892,9 +892,9 @@ class CassandraDataLayer(BaseDataLayer):
                 and hasattr(context.session.user, "createdAt")
             ):
                 user_obj = context.session.user
-                if hasattr(user_obj, "id") and str(getattr(user_obj, "id", None)) == str(
-                    user_id
-                ):
+                if hasattr(user_obj, "id") and str(
+                    getattr(user_obj, "id", None)
+                ) == str(user_id):
                     created_at = getattr(user_obj, "createdAt", None)
 
                     if created_at:
