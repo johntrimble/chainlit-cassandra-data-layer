@@ -23,7 +23,7 @@ import uuid_utils
 import uuid_utils.compat
 from cassandra.cluster import EXEC_PROFILE_DEFAULT, PreparedStatement, Session
 from cassandra.query import BatchStatement, BatchType
-from chainlit.context import context
+from chainlit.context import ChainlitContextException, context
 from chainlit.data.base import BaseDataLayer
 from chainlit.data.storage_clients.base import BaseStorageClient
 from chainlit.data.utils import queue_until_user_message
@@ -885,18 +885,25 @@ class CassandraDataLayer(BaseDataLayer):
     async def _get_user_created_at(self, user_id: uuid.UUID | str) -> datetime | None:
         """Get user from context or database by user ID."""
         # Try to get user from context
-        if (
-            context.session
-            and context.session.user
-            and hasattr(context.session.user, "createdAt")
-        ):
-            user_obj = context.session.user
-            if hasattr(user_obj, "id") and str(getattr(user_obj, "id", None)) == str(
-                user_id
+        try:
+            if (
+                context.session
+                and context.session.user
+                and hasattr(context.session.user, "createdAt")
             ):
-                created_at = getattr(user_obj, "createdAt", None)
-                if created_at:
-                    return created_at  # type: ignore[no-any-return]
+                user_obj = context.session.user
+                if hasattr(user_obj, "id") and str(
+                    getattr(user_obj, "id", None)
+                ) == str(user_id):
+                    created_at = getattr(user_obj, "createdAt", None)
+
+                    if created_at:
+                        if isinstance(created_at, str):
+                            return isoformat_to_datetime(created_at)
+                        return created_at  # type: ignore[no-any-return]
+        except ChainlitContextException:
+            # No context available, so we will look it up from the database
+            pass
 
         # Fallback to database lookup
         identifier = await self._get_user_identifier_for_id(user_id)
@@ -995,15 +1002,19 @@ class CassandraDataLayer(BaseDataLayer):
 
     def _thread_id_from_context(self) -> uuid.UUID | None:
         """Get thread_id from context, if available."""
-        thread_id = context.session.thread_id if context.session else None
-        if thread_id is None:
+        try:
+            thread_id = context.session.thread_id if context.session else None
+            if thread_id is None:
+                return None
+            elif isinstance(thread_id, uuid.UUID):
+                return thread_id
+            elif isinstance(thread_id, str):
+                return uuid.UUID(thread_id)
+            else:
+                raise ValueError("Invalid thread_id type in context")
+        except ChainlitContextException:
+            # No context available, just return None
             return None
-        elif isinstance(thread_id, uuid.UUID):
-            return thread_id
-        elif isinstance(thread_id, str):
-            return uuid.UUID(thread_id)
-        else:
-            raise ValueError("Invalid thread_id type in context")
 
     async def _current_thread_id_or_lookup_by_step(
         self, step_id: uuid.UUID | str
