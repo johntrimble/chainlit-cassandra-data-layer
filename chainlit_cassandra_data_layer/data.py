@@ -699,6 +699,7 @@ class CassandraDataLayer(BaseDataLayer):
                 name=row.thread_name,
             )
             for row in rows.current_rows
+            if row.activity_at is not None
         ]
 
     async def _update_activity_by_thread(
@@ -769,7 +770,6 @@ class CassandraDataLayer(BaseDataLayer):
 
         # Step 3: Add to batch insert latest activity into threads_by_user_activity
         latest_activity = activities[0]
-        print(latest_activity)
         partition_bucket, clustering_bucket = self.activity_bucket_strategy.get_bucket(
             latest_activity["activity_at"]
         )
@@ -808,7 +808,7 @@ class CassandraDataLayer(BaseDataLayer):
         WHERE thread_id = %s AND clustering_bucket_start = %s
         """
         tasks = []
-        for activity in activities:
+        for activity in old_activities:
             _, clustering_bucket = self.activity_bucket_strategy.get_bucket(
                 activity["activity_at"]
             )
@@ -1436,15 +1436,11 @@ class CassandraDataLayer(BaseDataLayer):
             raise ValueError("No queries to execute for create_step/update_step")
 
         # Update thread activity
-        # We do not wait for this to complete before returning because it's not
-        # essentially to step creation.
         if not is_update and thread_row and thread_row.user_id:
-            _ = asyncio.create_task(
-                self._update_activity(
-                    thread_id=thread_id_uuid,
-                    user_id=thread_row.user_id,
-                    activity_at=db_params["created_at"],
-                )
+            await self._update_activity(
+                thread_id=thread_id_uuid,
+                user_id=thread_row.user_id,
+                activity_at=db_params["created_at"],
             )
 
         await upsert_step_task
@@ -1877,31 +1873,42 @@ class CassandraDataLayer(BaseDataLayer):
     async def _delete_activity_entry(
         self,
         thread_id: uuid.UUID | str,
+        thread_created_at: uuid.UUID | str,
         user_id: uuid.UUID | str,
         activity_at: uuid.UUID | str,
     ):
         thread_id_uuid = to_uuid(thread_id)
+        thread_created_at_uuid = to_uuid(thread_created_at)
         user_id_uuid = to_uuid(user_id)
         activity_at_uuid = to_uuid(activity_at)
 
         if not thread_id_uuid or not user_id_uuid or not activity_at_uuid:
             raise ValueError("Invalid UUID provided")
 
+        partition_bucket_start, clustering_bucket_start = (
+            self.activity_bucket_strategy.get_bucket(activity_at_uuid)
+        )
+
         delete_by_user_activity_query = f"""
         DELETE FROM {self._table_threads_by_user_activity}
-        WHERE user_id = %s AND activity_at = %s AND thread_id = %s
+        WHERE user_id = %s AND partition_bucket_start = %s AND clustering_bucket_start = %s AND thread_created_at = %s
         """
 
         delete_user_activity_by_thread_query = f"""
         DELETE FROM {self._table_user_activity_by_thread}
-        WHERE thread_id = %s AND activity_at = %s
+        WHERE thread_id = %s AND clustering_bucket_start = %s
         """
 
         # First delete from the main activity table
         await aexecute(
             self.session,
             delete_by_user_activity_query,
-            (user_id_uuid, activity_at_uuid, thread_id_uuid),
+            (
+                user_id_uuid,
+                partition_bucket_start,
+                clustering_bucket_start,
+                thread_created_at_uuid,
+            ),
         )
 
         # Second delete from the activity by thread table only if the first
@@ -1913,13 +1920,17 @@ class CassandraDataLayer(BaseDataLayer):
         await aexecute(
             self.session,
             delete_user_activity_by_thread_query,
-            (thread_id_uuid, activity_at_uuid),
+            (
+                thread_id_uuid,
+                clustering_bucket_start,
+            ),
         )
 
-    async def _delete_thread_activity_entries(self, thread_id: uuid.UUID | str):
-        thread_id = (
-            thread_id if isinstance(thread_id, uuid.UUID) else uuid.UUID(thread_id)
-        )
+    async def _delete_thread_activity_entries(
+        self, thread_id: uuid.UUID | str, thread_created_at: uuid.UUID | str
+    ):
+        thread_id_uuid = to_uuid(thread_id)
+        assert thread_id_uuid is not None
         activity_by_thread_query = f"""
         SELECT user_id, activity_at FROM {self._table_user_activity_by_thread}
         WHERE thread_id = %s
@@ -1927,7 +1938,7 @@ class CassandraDataLayer(BaseDataLayer):
         rs = await aexecute(
             self.session,
             activity_by_thread_query,
-            (thread_id,),
+            (thread_id_uuid,),
         )
         activity_at_and_user_ids = [
             (row.activity_at, row.user_id)
@@ -1938,7 +1949,8 @@ class CassandraDataLayer(BaseDataLayer):
         for activity_at, user_id in activity_at_and_user_ids:
             delete_activity_tasks.append(
                 self._delete_activity_entry(
-                    thread_id,
+                    thread_id_uuid,
+                    thread_created_at,
                     user_id,
                     activity_at,
                 )
@@ -1952,7 +1964,7 @@ class CassandraDataLayer(BaseDataLayer):
                 self.log.error(
                     "Error deleting activity",
                     extra={
-                        "thread_id": str(thread_id),
+                        "thread_id": str(thread_id_uuid),
                         "user_id": str(user_id),
                         "activity_at": str(activity_at),
                     },
@@ -1961,7 +1973,7 @@ class CassandraDataLayer(BaseDataLayer):
         exceptions = select_exc(result_activity_deletions)
         if exceptions:
             raise ExceptionGroup(
-                f"Failed to delete some activity entries for thread {str(thread_id)}",
+                f"Failed to delete some activity entries for thread {str(thread_id_uuid)}",
                 list(exceptions),  # type: ignore[type-var]
             )
 
@@ -1980,9 +1992,7 @@ class CassandraDataLayer(BaseDataLayer):
             raise ValueError(f"Invalid thread_id: {thread_id}")
 
         # Get thread info for activity cleanup
-        thread_query = (
-            f"SELECT user_id, deleted_at FROM {self._table_threads} WHERE id = %s"
-        )
+        thread_query = f"SELECT user_id, deleted_at, created_at FROM {self._table_threads} WHERE id = %s"
         thread_rs = await self._aexecute_prepared(thread_query, (thread_id_uuid,))
         thread_row = thread_rs.one()
 
@@ -2000,6 +2010,7 @@ class CassandraDataLayer(BaseDataLayer):
 
         # At this point, the thread is marked deleted which should stop any
         # further use of it. We can run the remaining cleanup steps in parallel.
+        thread_created_at = thread_row.created_at
 
         async def cleanup_thread():
             # Step 2: Delete all steps
@@ -2018,7 +2029,7 @@ class CassandraDataLayer(BaseDataLayer):
 
             # Step 3: Delete all activity
             delete_activity_task = asyncio.create_task(
-                self._delete_thread_activity_entries(thread_id_uuid)
+                self._delete_thread_activity_entries(thread_id_uuid, thread_created_at)
             )
 
             result_step_deletions = await asyncio.gather(
