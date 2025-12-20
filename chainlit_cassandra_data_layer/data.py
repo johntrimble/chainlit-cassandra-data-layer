@@ -1929,7 +1929,8 @@ class CassandraDataLayer(BaseDataLayer):
     async def _delete_thread_activity_entries(
         self, thread_id: uuid.UUID | str, thread_created_at: uuid.UUID | str
     ):
-        thread_id = to_uuid(thread_id)
+        thread_id_uuid = to_uuid(thread_id)
+        assert thread_id_uuid is not None
         activity_by_thread_query = f"""
         SELECT user_id, activity_at FROM {self._table_user_activity_by_thread}
         WHERE thread_id = %s
@@ -1937,7 +1938,7 @@ class CassandraDataLayer(BaseDataLayer):
         rs = await aexecute(
             self.session,
             activity_by_thread_query,
-            (thread_id,),
+            (thread_id_uuid,),
         )
         activity_at_and_user_ids = [
             (row.activity_at, row.user_id)
@@ -1948,7 +1949,7 @@ class CassandraDataLayer(BaseDataLayer):
         for activity_at, user_id in activity_at_and_user_ids:
             delete_activity_tasks.append(
                 self._delete_activity_entry(
-                    thread_id,
+                    thread_id_uuid,
                     thread_created_at,
                     user_id,
                     activity_at,
@@ -1963,7 +1964,7 @@ class CassandraDataLayer(BaseDataLayer):
                 self.log.error(
                     "Error deleting activity",
                     extra={
-                        "thread_id": str(thread_id),
+                        "thread_id": str(thread_id_uuid),
                         "user_id": str(user_id),
                         "activity_at": str(activity_at),
                     },
@@ -1972,7 +1973,7 @@ class CassandraDataLayer(BaseDataLayer):
         exceptions = select_exc(result_activity_deletions)
         if exceptions:
             raise ExceptionGroup(
-                f"Failed to delete some activity entries for thread {str(thread_id)}",
+                f"Failed to delete some activity entries for thread {str(thread_id_uuid)}",
                 list(exceptions),  # type: ignore[type-var]
             )
 
