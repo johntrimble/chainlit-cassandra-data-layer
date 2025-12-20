@@ -595,7 +595,7 @@ class CassandraDataLayer(BaseDataLayer):
         self._table_threads_by_user_activity = self._qualified_table(
             "threads_by_user_activity"
         )
-        self._table_steps = self._qualified_table("steps")
+        # self._table_steps = self._qualified_table("steps")
         self._table_steps_by_thread = self._qualified_table("steps_by_thread_id")
         self._table_elements_by_thread = self._qualified_table("elements_by_thread_id")
         self._table_user_activity_by_thread = self._qualified_table(
@@ -982,23 +982,23 @@ class CassandraDataLayer(BaseDataLayer):
 
     # Feedback methods
 
-    async def _thread_id_for_step_id(
-        self, step_id: uuid.UUID | str
-    ) -> tuple[uuid.UUID, uuid.UUID | None] | None:
-        """Get thread_id for a given step_id.
+    # async def _thread_id_for_step_id(
+    #     self, step_id: uuid.UUID | str
+    # ) -> tuple[uuid.UUID, uuid.UUID | None] | None:
+    #     """Get thread_id for a given step_id.
 
-        This is needed to locate the step since steps are keyed by (thread_id, id).
-        """
-        step_id = step_id if isinstance(step_id, uuid.UUID) else uuid.UUID(str(step_id))
-        query = f"""
-        SELECT thread_id, deleted_at FROM {self._table_steps}
-        WHERE id = %s
-        """
-        rs = await self._aexecute_prepared(query, (step_id,))
-        row = rs.one()
-        if not row:
-            return None
-        return (row.thread_id, row.deleted_at)
+    #     This is needed to locate the step since steps are keyed by (thread_id, id).
+    #     """
+    #     step_id = step_id if isinstance(step_id, uuid.UUID) else uuid.UUID(str(step_id))
+    #     query = f"""
+    #     SELECT thread_id, deleted_at FROM {self._table_steps}
+    #     WHERE id = %s
+    #     """
+    #     rs = await self._aexecute_prepared(query, (step_id,))
+    #     row = rs.one()
+    #     if not row:
+    #         return None
+    #     return (row.thread_id, row.deleted_at)
 
     def _thread_id_from_context(self) -> uuid.UUID | None:
         """Get thread_id from context, if available."""
@@ -1037,7 +1037,7 @@ class CassandraDataLayer(BaseDataLayer):
         step_id = uuid.UUID(step_id_str)
 
         # Find the thread ID for the step
-        thread_id = await self._current_thread_id_or_lookup_by_step(step_id)
+        thread_id = context.session.thread_id
         if thread_id is None:
             self.log.warning(f"Cannot delete feedback {feedback_id} - step not found")
             return False
@@ -1401,23 +1401,23 @@ class CassandraDataLayer(BaseDataLayer):
 
         queries_and_params = [(query, tuple(db_params.values()))]
 
-        if not is_update:
-            # Populate the steps table as well for creates. This is so we can
-            # map back to the thread from the step ID later if needed.
-            steps_table_query = f"""
-            INSERT INTO {self._table_steps} (id, thread_id, created_at)
-            VALUES (%s, %s, %s)
-            """
-            queries_and_params.append(
-                (
-                    steps_table_query,
-                    (
-                        db_params["id"],
-                        db_params["thread_id"],
-                        db_params["created_at"],
-                    ),
-                )
-            )
+        # if not is_update:
+        #     # Populate the steps table as well for creates. This is so we can
+        #     # map back to the thread from the step ID later if needed.
+        #     steps_table_query = f"""
+        #     INSERT INTO {self._table_steps} (id, thread_id, created_at)
+        #     VALUES (%s, %s, %s)
+        #     """
+        #     queries_and_params.append(
+        #         (
+        #             steps_table_query,
+        #             (
+        #                 db_params["id"],
+        #                 db_params["thread_id"],
+        #                 db_params["created_at"],
+        #             ),
+        #         )
+        #     )
 
         upsert_step_task: asyncio.Task
 
@@ -1492,11 +1492,11 @@ class CassandraDataLayer(BaseDataLayer):
             if not deleted_at:
                 deleted_at = uuid7()
 
-                soft_delete_steps_table_query = f"""
-                UPDATE {self._table_steps}
-                SET deleted_at = %s
-                WHERE id = %s
-                """
+                # soft_delete_steps_table_query = f"""
+                # UPDATE {self._table_steps}
+                # SET deleted_at = %s
+                # WHERE id = %s
+                # """
 
                 soft_delete_steps_by_thread_query = f"""
                 UPDATE {self._table_steps_by_thread}
