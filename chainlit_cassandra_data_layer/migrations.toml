@@ -119,7 +119,7 @@ statements = [
     user_id UUID STATIC,
     thread_name TEXT STATIC,
     thread_created_at UUID STATIC,      -- uuidv7 timestamp
-    PRIMARY KEY (thread_id, clustering_bucket_start, activity_at)
+    PRIMARY KEY (thread_id, clustering_bucket_start)
   )
   WITH CLUSTERING ORDER BY (clustering_bucket_start DESC)
   AND COMPACTION = { 'class': 'UnifiedCompactionStrategy' };

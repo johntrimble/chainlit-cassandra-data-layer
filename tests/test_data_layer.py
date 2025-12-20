@@ -498,6 +498,13 @@ class TestThreadOperations:
             tags=["test", "demo"],
         )
 
+        activities = await data_layer._get_activities_for_thread(
+            uuid.UUID(persisted_user.id), uuid.UUID(test_thread_id), limit=20
+        )
+
+        for activity in activities:
+            assert activity["activity_at"] is not None, "Activity missing activity_at"
+
         # Get thread
         thread = await data_layer.get_thread(test_thread_id)
         assert thread is not None
@@ -1100,6 +1107,12 @@ class TestStepOperations:
             "isError": False,
         }
         await data_layer.create_step(step_dict)
+
+        # Verify new activity is created on update
+        activities = await data_layer._get_activities_for_thread(
+            uuid.UUID(persisted_user.id), uuid.UUID(test_thread_id), limit=10
+        )
+        assert len(activities) > 0, "Expected at least one activity after update"
 
         # Get thread and verify step
         thread = await data_layer.get_thread(test_thread_id)
