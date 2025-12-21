@@ -13,8 +13,10 @@ from datetime import UTC, datetime, timedelta
 from typing import (
     Any,
     NotRequired,
+    Tuple,
     TypedDict,
     cast,
+    overload,
 )
 
 import aiofiles
@@ -64,7 +66,10 @@ except ImportError:
 # This prevents excessive memory usage and ensures reasonable query performance
 DEFAULT_THREADS_PER_PAGE = 200
 
-FEEDBACK_ID_REGEX:re.Pattern = re.compile(r"^THREAD#([0-9a-fA-F-]{36})::STEP#([0-9a-fA-F-]{36})$")
+FEEDBACK_ID_REGEX: re.Pattern = re.compile(
+    r"^THREAD#([0-9a-fA-F-]{36})::STEP#([0-9a-fA-F-]{36})$"
+)
+
 
 def first_exc(items: Collection) -> Exception | None:
     for item in items:
@@ -73,8 +78,8 @@ def first_exc(items: Collection) -> Exception | None:
     return None
 
 
-def select_exc(items: Sequence) -> Sequence[BaseException]:
-    return [item for item in items if isinstance(item, BaseException)]
+def select_exc(items: Sequence) -> Sequence[Exception]:
+    return [item for item in items if isinstance(item, Exception)]
 
 
 def raise_first_exc[T: Sequence](items: T) -> T:
@@ -110,7 +115,7 @@ def _thread_step_id_to_feedback_id(thread_id: uuid.UUID, step_id: uuid.UUID) -> 
     return f"THREAD#{str(thread_id)}::STEP#{str(step_id)}"
 
 
-def _feedback_id_to_thread_step_id(feedback_id: str) -> str:
+def _feedback_id_to_thread_step_id(feedback_id: str) -> Tuple[uuid.UUID, uuid.UUID]:
     """Extract step_id from feedback_id format: step#<uuid> -> <uuid>.
 
     Reverses the _step_id_to_feedback_id conversion. If the feedback_id doesn't
@@ -121,7 +126,13 @@ def _feedback_id_to_thread_step_id(feedback_id: str) -> str:
         raise ValueError(f"Invalid feedback_id format: {feedback_id}")
 
     thread_id, step_id = m.groups()
-    return (to_uuid(thread_id), to_uuid(step_id))
+    thread_id_uuid = to_uuid(thread_id)
+    step_id_uuid = to_uuid(step_id)
+
+    assert thread_id_uuid is not None
+    assert step_id_uuid is not None
+
+    return (thread_id_uuid, step_id_uuid)
 
 
 class _ThreadActivity(TypedDict):
@@ -208,6 +219,14 @@ def to_uuid_utils_uuid(u: str | uuid.UUID | uuid_utils.UUID) -> uuid_utils.UUID:
     else:
         raise ValueError(f"Cannot convert to uuid_utils.UUID of type {type(u)}")
 
+
+@overload
+def to_uuid(u: str | uuid.UUID | uuid_utils.UUID) -> uuid.UUID:
+    ...
+
+@overload
+def to_uuid(u: str | uuid.UUID | uuid_utils.UUID | None) -> uuid.UUID | None:
+    ...
 
 def to_uuid(u: str | uuid.UUID | uuid_utils.UUID | None) -> uuid.UUID | None:
     """Convert a UUID input to a standard library uuid.UUID object."""
@@ -1001,19 +1020,6 @@ class CassandraDataLayer(BaseDataLayer):
             # No context available, just return None
             return None
 
-    async def _current_thread_id_or_lookup_by_step(
-        self, step_id: uuid.UUID | str
-    ) -> uuid.UUID | None:
-        """Get thread_id from context, or lookup by step_id if not available."""
-        thread_id = self._thread_id_from_context()
-        if thread_id is not None:
-            return thread_id
-        lookup_result = await self._thread_id_for_step_id(step_id)
-        if lookup_result is None:
-            return None
-        thread_id, _ = lookup_result
-        return thread_id
-
     async def delete_feedback(self, feedback_id: str) -> bool:
         """Delete feedback by ID."""
 
@@ -1379,7 +1385,9 @@ class CassandraDataLayer(BaseDataLayer):
         VALUES ({placeholders})
         """
 
-        upsert_step_task = asyncio.create_task(self._aexecute_prepared(query, tuple(db_params.values())))
+        upsert_step_task = asyncio.create_task(
+            self._aexecute_prepared(query, tuple(db_params.values()))
+        )
 
         # Update thread activity
         if not is_update and thread_row and thread_row.user_id:
@@ -1424,12 +1432,10 @@ class CassandraDataLayer(BaseDataLayer):
         following the DynamoDB implementation pattern.
         """
         thread_id = self._thread_id_from_context()
-        return await self._delete_step(
-            thread_id,
-            to_uuid(step_id)
-        )
+        assert thread_id is not None, "Thread ID must be available in context"
+        return await self._delete_step(thread_id, to_uuid(step_id))
 
-    async def _delete_step(self, thread_id:uuid.UUID, step_id:uuid.UUID):
+    async def _delete_step(self, thread_id: uuid.UUID, step_id: uuid.UUID):
         # Step 1: Perform soft-delete
         deleted_at = uuid7()
 
@@ -1454,9 +1460,7 @@ class CassandraDataLayer(BaseDataLayer):
             FROM {self._table_elements_by_thread}
             WHERE thread_id = %s
             """
-            elements_rs = await self._aexecute_prepared(
-                elements_query, (thread_id,)
-            )
+            elements_rs = await self._aexecute_prepared(elements_query, (thread_id,))
 
             # Delete all elements in parallel using existing delete_element
             # This properly cleans up storage AND deletes from both tables
@@ -1484,7 +1488,6 @@ class CassandraDataLayer(BaseDataLayer):
                 raise ExceptionGroup("Failed to cleanup step", list(exceptions))
 
         await cleanup_step()
-
 
     # Thread methods
 
@@ -1548,7 +1551,9 @@ class CassandraDataLayer(BaseDataLayer):
             feedback = None
             if row.feedback_value is not None:
                 feedback = FeedbackDict(
-                    id=_thread_step_id_to_feedback_id(thread_row.id, row.id),  # Generate feedback_id
+                    id=_thread_step_id_to_feedback_id(
+                        thread_row.id, row.id
+                    ),  # Generate feedback_id
                     forId=str(row.id),  # Convert UUID to string
                     value=row.feedback_value,
                     comment=row.feedback_comment,
@@ -1898,7 +1903,7 @@ class CassandraDataLayer(BaseDataLayer):
         if exceptions:
             raise ExceptionGroup(
                 f"Failed to delete some activity entries for thread {str(thread_id_uuid)}",
-                list(exceptions),  # type: ignore[type-var]
+                list(exceptions),
             )
 
     async def delete_thread(self, thread_id: str):
@@ -1935,7 +1940,7 @@ class CassandraDataLayer(BaseDataLayer):
         # At this point, the thread is marked deleted which should stop any
         # further use of it. We can run the remaining cleanup steps in parallel.
 
-        async def cleanup_thread(thread_id:uuid.UUID, thread_created_at:uuid.UUID):
+        async def cleanup_thread(thread_id: uuid.UUID, thread_created_at: uuid.UUID):
             # Step 2: Delete all steps
             select_step_ids_query = (
                 f"SELECT id FROM {self._table_steps_by_thread} WHERE thread_id = %s"
@@ -1973,7 +1978,7 @@ class CassandraDataLayer(BaseDataLayer):
                 delete_activity_task, return_exceptions=True
             )
 
-            exceptions = select_exc(result_step_deletions + result_activity_deletions)
+            exceptions = select_exc(list(result_step_deletions) + list(result_activity_deletions))
             if exceptions:
                 raise ExceptionGroup(
                     f"Failed to delete some data for thread {str(thread_id)}",
