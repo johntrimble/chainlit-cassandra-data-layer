@@ -221,12 +221,12 @@ def to_uuid_utils_uuid(u: str | uuid.UUID | uuid_utils.UUID) -> uuid_utils.UUID:
 
 
 @overload
-def to_uuid(u: str | uuid.UUID | uuid_utils.UUID) -> uuid.UUID:
-    ...
+def to_uuid(u: str | uuid.UUID | uuid_utils.UUID) -> uuid.UUID: ...
+
 
 @overload
-def to_uuid(u: str | uuid.UUID | uuid_utils.UUID | None) -> uuid.UUID | None:
-    ...
+def to_uuid(u: str | uuid.UUID | uuid_utils.UUID | None) -> uuid.UUID | None: ...
+
 
 def to_uuid(u: str | uuid.UUID | uuid_utils.UUID | None) -> uuid.UUID | None:
     """Convert a UUID input to a standard library uuid.UUID object."""
@@ -1978,7 +1978,9 @@ class CassandraDataLayer(BaseDataLayer):
                 delete_activity_task, return_exceptions=True
             )
 
-            exceptions = select_exc(list(result_step_deletions) + list(result_activity_deletions))
+            exceptions = select_exc(
+                list(result_step_deletions) + list(result_activity_deletions)
+            )
             if exceptions:
                 raise ExceptionGroup(
                     f"Failed to delete some data for thread {str(thread_id)}",
