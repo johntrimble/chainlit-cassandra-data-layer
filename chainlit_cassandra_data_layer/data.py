@@ -13,7 +13,6 @@ from datetime import UTC, datetime, timedelta
 from typing import (
     Any,
     NotRequired,
-    Tuple,
     TypedDict,
     cast,
     overload,
@@ -115,7 +114,7 @@ def _thread_step_id_to_feedback_id(thread_id: uuid.UUID, step_id: uuid.UUID) -> 
     return f"THREAD#{str(thread_id)}::STEP#{str(step_id)}"
 
 
-def _feedback_id_to_thread_step_id(feedback_id: str) -> Tuple[uuid.UUID, uuid.UUID]:
+def _feedback_id_to_thread_step_id(feedback_id: str) -> tuple[uuid.UUID, uuid.UUID]:
     """Extract step_id from feedback_id format: step#<uuid> -> <uuid>.
 
     Reverses the _step_id_to_feedback_id conversion. If the feedback_id doesn't
