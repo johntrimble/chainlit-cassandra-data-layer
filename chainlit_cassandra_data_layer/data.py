@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import (
     Any,
+    List,
     NotRequired,
     TypedDict,
     cast,
@@ -2234,3 +2235,6 @@ class CassandraDataLayer(BaseDataLayer):
             self.session.shutdown()
         if self.cluster and not self.cluster.is_shutdown:
             self.cluster.shutdown()
+
+    async def get_favorite_steps(self, user_id: str) -> List["StepDict"]:
+        return []
